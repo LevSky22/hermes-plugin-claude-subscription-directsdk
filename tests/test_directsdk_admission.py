@@ -159,3 +159,78 @@ def test_invalid_stream_json_error_names_the_offending_line(tmp_path):
             client.create(model='sonnet',messages=[{'role':'user','content':'fixture'}])
     finally:
         client.close()
+
+
+def test_abort_closes_sockets_where_shutdown_cannot_wake_a_blocked_recv(monkeypatch):
+    """Windows: shutdown() does not wake a recv blocked in another thread (the relay waiting on a hung
+    upstream), so close() would wait for the upstream; closesocket() cancels it. POSIX keeps shutdown only."""
+    import admission
+    calls = []
+    class Sock:
+        def shutdown(self, how):
+            calls.append('shutdown')
+        def detach(self):
+            calls.append('detach')
+            return -1  # no real handle behind the fake
+    for windows, expected in ((False, ['shutdown']), (True, ['shutdown', 'detach'])):
+        monkeypatch.setattr(admission, '_CANCEL_BY_CLOSE', windows, raising=False)
+        gate = admission.Admission('https://api.anthropic.com', 5)
+        try:
+            calls.clear()
+            gate.sockets.add(Sock())
+            gate.abort()
+            assert calls == expected
+        finally:
+            gate.sockets.clear()
+            gate.close()
+
+
+
+@pytest.mark.parametrize('close_flag', [False, True])
+def test_abort_wakes_a_real_getresponse_blocked_on_a_silent_upstream(monkeypatch, close_flag):
+    """A real http.client read (which holds makefile() refs, so socket.close() alone never reaches the OS)
+    blocked on an upstream that accepts and never answers must end promptly after abort()."""
+    import admission, http.client, socket, time
+    monkeypatch.setattr(admission, '_CANCEL_BY_CLOSE', close_flag, raising=False)
+    entered, target = threading.Event(), []
+    real_readinto = socket.SocketIO.readinto
+    def readinto(self, buffer):
+        if target and self._sock is target[0]:
+            entered.set()  # the reader is about to block in recv on the upstream socket
+        return real_readinto(self, buffer)
+    monkeypatch.setattr(socket.SocketIO, 'readinto', readinto)
+    listener = socket.create_server(('127.0.0.1', 0))
+    listener.settimeout(5)
+    gate = admission.Admission('https://api.anthropic.com', 30)
+    conn = http.client.HTTPConnection('127.0.0.1', listener.getsockname()[1], timeout=30)
+    peer = reader = None
+    try:
+        conn.request('POST', '/v1/messages', b'{}')
+        peer, _ = listener.accept()  # held open and silent: the upstream never answers
+        target.append(conn.sock)
+        gate.sockets.add(conn.sock)
+        outcome = []
+        def read():
+            try:
+                outcome.append(conn.getresponse())
+            except Exception as error:
+                outcome.append(error)
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        assert entered.wait(5), 'the reader never reached the blocking read'
+        time.sleep(.2)  # let it pass from readinto() into the recv syscall
+        assert reader.is_alive() and not outcome, 'the upstream never answers; the read must still be blocked'
+        started = time.monotonic()
+        gate.abort()
+        reader.join(3)
+        assert not reader.is_alive() and time.monotonic() - started < 3
+        assert outcome and isinstance(outcome[0], Exception)
+    finally:
+        gate.sockets.clear()
+        gate.close()
+        if peer is not None:
+            peer.close()  # EOF wakes a reader the abort failed to wake
+        conn.close()
+        listener.close()
+        if reader is not None:
+            reader.join(5)
