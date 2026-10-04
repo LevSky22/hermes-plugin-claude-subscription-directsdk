@@ -47,7 +47,7 @@ assert 'metadata' not in wire
 blocks=[{'type':'thinking','thinking':'private','signature':'signed-test'}, {'type':'text','text':'hello\n'}, {'type':'tool_use','id':'toolu_test','name':os.environ.get('TOOL_NAME','mcp__hermes__probe'),'input':{'value':'x'}}]
 if len(rows)>1:
  if rows[1]['message']['content'][0]['type']=='thinking':
-  assert rows[1]['message']['content']==blocks
+  assert rows[1]['message']['content']==[dict(b, name=os.environ.get('REPLAY_NAME', b['name'])) if b['type']=='tool_use' else b for b in blocks]
  else:
   assert rows[1]['message']['content'][0]['text']=='middleware changed'
  blocks=[{'type':'text','text':'done'}]
@@ -192,6 +192,31 @@ class Contract(unittest.TestCase):
                                           "content": f"Tool '{host_name}' does not exist. Available tools: probe"}]
                 self.assertEqual(client.chat.completions.create(**req).choices[0].message.content, "done")
                 client.close()
+
+    def test_bare_host_name_maps_to_the_tool_and_replays_with_the_offered_name(self):
+        # Native sometimes drops the MCP prefix on a tool it was offered (#62: `search_files`,
+        # `terminal`). The host gets the tool, and the carried native block is rewritten so the next
+        # request replays the name native was offered, not the slip it would keep imitating.
+        with tempfile.TemporaryDirectory() as tmp:
+            client = self.client(tmp, TOOL_NAME="probe", REPLAY_NAME="mcp__hermes__probe")
+            for streaming in (False, True):
+                req = self.request()
+                result = client.chat.completions.create(**req, stream=streaming)
+                if streaming:
+                    chunks = list(result)
+                    calls = [tc for c in chunks if c.choices for tc in (c.choices[0].delta.tool_calls or [])]
+                    details = [d for c in chunks if c.choices for d in (getattr(c.choices[0].delta, "reasoning_details", None) or [])]
+                else:
+                    calls, details = result.choices[0].message.tool_calls, result.choices[0].message.reasoning_details
+                self.assertEqual([c.function.name for c in calls], ["probe"])
+                carried = [b["name"] for m in details[0]["messages"] for b in m["content"] if b["type"] == "tool_use"]
+                self.assertEqual(carried, ["mcp__hermes__probe"])
+            msg = client.chat.completions.create(**req).choices[0].message.model_dump()
+            msg["content"] = (msg.get("content") or "").strip()
+            req["messages"] += [msg, {"role": "tool", "tool_call_id": "toolu_test", "content": "ok"}]
+            # The fake native asserts the replayed tool_use carries REPLAY_NAME.
+            self.assertEqual(client.chat.completions.create(**req).choices[0].message.content, "done")
+            client.close()
 
     def test_logged_out_native_raises_the_login_hint(self):
         import directsdk

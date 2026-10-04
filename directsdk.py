@@ -529,7 +529,7 @@ class Client:
             if self._closed:
                 raise RuntimeError('Claude client is closed')
             self._requests.add(request)
-        stream = Stream(self._run(request, kwargs, body, manifest, system, frames), request)
+        stream = Stream(self._run(request, kwargs, body, manifest, names, system, frames), request)
         if kwargs.get('stream'):
             return stream
         try:
@@ -540,7 +540,7 @@ class Client:
         finally:
             stream.close()
 
-    def _run(self, request, kwargs, body, manifest, system, frames):
+    def _run(self, request, kwargs, body, manifest, names, system, frames):
         p = None
         reader = None
         try:
@@ -694,6 +694,10 @@ class Client:
                         # Native built-ins are off (--tools '', inert MCP, dontAsk), so any other name is
                         # the model's, e.g. a Tool Search-deferred tool called directly (#39). Hermes owns
                         # validation and answers an unknown name with a recoverable error.
+                        if block['name'] in names:
+                            # Native sometimes drops the prefix on a tool it was offered (#62); carry the
+                            # offered name so replayed history does not teach the slip back to the model.
+                            block['name'] = PREFIX + block['name']
                         name = block['name'].removeprefix(PREFIX)
                         calls.append({'id': block['id'], 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(block['input'], separators=(',', ':'), allow_nan=False)}})
                 boundary = bool(calls) and final.get('subtype') == 'error_max_turns' and p.returncode == 1
