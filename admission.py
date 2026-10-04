@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import ipaddress
 import json
 import logging
+import os
 import re
 import secrets
 import socket
@@ -45,6 +46,12 @@ def keepalive(sock):
 
 class QueriedTurnMismatch(ValueError):
     """The native request could not be reconciled with Hermes' tool results."""
+
+
+# Winsock: shutdown() does not wake a recv blocked in another thread; closesocket() cancels pending calls.
+# Without it close() waits for a hung upstream (the single-threaded relay is stuck in getresponse()).
+# socket.close() is not enough: http.client holds makefile() refs, so it never reaches closesocket().
+_CANCEL_BY_CLOSE = os.name == 'nt'
 
 
 def _plain(block):
@@ -401,6 +408,14 @@ class Admission:
                     sock.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass  # Peer may have closed between the read and cancellation.
+                if _CANCEL_BY_CLOSE:
+                    try:
+                        # detach() marks the object closed (no later double close) and hands back the OS handle.
+                        fd = sock.detach()
+                        if fd is not None and fd >= 0:
+                            socket.close(fd)
+                    except OSError:
+                        pass
 
     def close(self):
         self.abort()
