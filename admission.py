@@ -17,10 +17,11 @@ import urllib.request
 
 
 UNCACHEABLE = ('thinking', 'redacted_thinking')
-# A streaming upstream sends SSE pings every few seconds; a minute of silence after the headers is a
-# dead stream, not a slow one. Bounded independently of the request timeout (Hermes' compression floor
-# is 300 s, which equals its own stall detector: a silent stream then surfaces as a stall, not an error).
-UPSTREAM_IDLE_SECONDS = 60
+# Longest byte silence after the headers before the stream counts as dead. Anthropic documents no ping
+# cadence ("any number of ping events"); this is native's own byte-level watchdog against api.anthropic.com
+# (180 s, native 2.1.263-2.1.286). Behind this relay native widens its watchdog to 300 s, the same as Hermes'
+# compression floor and stall detector, so a silent upstream surfaced as a stall instead of this error.
+UPSTREAM_IDLE_SECONDS = 180
 # Probe a quiet upstream socket so a dead path fails in ~30 s instead of waiting on TCP retransmits.
 KEEPALIVE = (('TCP_KEEPIDLE', 15), ('TCP_KEEPALIVE', 15), ('TCP_KEEPINTVL', 5), ('TCP_KEEPCNT', 3))
 

@@ -189,6 +189,30 @@ def test_silent_upstream_fails_fast_instead_of_hanging(tmp_path, monkeypatch):
         release.set(); client.close(); peer.shutdown(); thread.join(); peer.server_close()
 
 
-def test_idle_bound_fits_the_acceptance_window():
+def test_pings_keep_a_slow_upstream_alive(tmp_path, monkeypatch):
+    """Long thinking streams only pings for a while; bytes inside the idle bound must never fail it."""
+    import time
     import admission
-    assert admission.UPSTREAM_IDLE_SECONDS <= 60
+    monkeypatch.setattr(admission, 'UPSTREAM_IDLE_SECONDS', 1)
+    usage = {'input_tokens':0, 'output_tokens':0}
+    class Peer(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            self.send_response(200); self.send_header('Content-Type','text/event-stream'); self.end_headers()
+            send = lambda e: (self.wfile.write(('data: '+json.dumps(e)+'\n\n').encode()), self.wfile.flush())
+            send({'type':'message_start','message':{'id':'first','role':'assistant','model':'sonnet','content':[],'usage':usage}})
+            for _ in range(6):  # 3 s of pings, three times the patched idle bound
+                time.sleep(.5); send({'type':'ping'})
+            send({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})
+            send({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':'FIRST'}})
+            send({'type':'content_block_stop','index':0})
+            send({'type':'message_delta','delta':{'stop_reason':'end_turn'},'usage':usage}); send({'type':'message_stop'})
+    peer=ThreadingHTTPServer(('127.0.0.1',0),Peer)
+    thread=threading.Thread(target=peer.serve_forever,daemon=True); thread.start()
+    native=tmp_path/'native.py'; native.write_text(NATIVE.replace('timeout=5', 'timeout=60'))
+    client=directsdk.Client(command=[sys.executable,str(native)],env={'PATH':os.defpath,'HOME':str(tmp_path),'ANTHROPIC_BASE_URL':f'http://127.0.0.1:{peer.server_port}'})
+    try:
+        assert client.create(model='sonnet',messages=[{'role':'user','content':'fixture'}],timeout=20).choices[0].message.content == 'FIRST'
+    finally:
+        client.close(); peer.shutdown(); thread.join(); peer.server_close()
