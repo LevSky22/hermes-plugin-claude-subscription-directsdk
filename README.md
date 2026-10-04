@@ -19,7 +19,7 @@ The plugin checks for `claude` at every seam and never guesses:
 | `/model`, Desktop/TUI picker | the pinned catalog is listed (no live account picker) |
 | a request | fails immediately with the install hint instead of a `Popen` traceback |
 
-Install Claude Code with `npm install -g @anthropic-ai/claude-code`, or point `CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND` at the binary if it lives outside `PATH`. The `plugin.yaml` declares the same requirement under `external_dependencies`.
+Install Claude Code with `npm install -g @anthropic-ai/claude-code`. `claude` is looked up on `PATH`, then in the usual install directories (`~/.local/bin`, `~/.claude/local`, `~/bin`, `~/.npm-global/bin`, `~/.bun/bin`, `~/.volta/bin`, `/opt/homebrew/bin`, `/usr/local/bin`), so a backend started by a LaunchAgent or Hermes Desktop with a minimal `PATH` still finds it. Point `CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND` at the binary if it lives anywhere else. The `plugin.yaml` declares the same requirement under `external_dependencies`.
 
 ## Install
 
@@ -129,7 +129,7 @@ providers:
 
 Selecting the provider asks the Claude CLI itself, never Anthropic, before anything is saved:
 
-1. **Installed?** `claude` must resolve on PATH (or `CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND`). Otherwise one line: install with `npm install -g @anthropic-ai/claude-code`, and the flow stops without touching config.
+1. **Installed?** `claude` must resolve on PATH, in a usual install directory, or through `CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND`. Otherwise one line: install with `npm install -g @anthropic-ai/claude-code`, and the flow stops without touching config.
 2. **Logged in?** `claude auth status` (local credential store, ~0.3s). Logged in shows `credentials: ✓ (Claude Pro)`. Logged out on a terminal starts `claude auth login` inline; it opens the browser and takes the pasted code, then the flow re-checks and continues. Without a TTY it prints the instruction and stops.
 3. **Which models?** The CLI's `initialize` handshake returns the account's own picker (verified through the admission relay: zero upstream requests). Every row is listed; the pinned catalog below only adds metadata to the models it knows. Pinned rows are mapped to Hermes route ids and deduplicated (`opus` and `opus[1m]` are one 1M route). A model the catalog does not pin yet keeps the id and label the CLI announced and carries a dim `· unpinned` note; it gets `[1m]` only when the CLI itself offers that form, and a plain + `[1m]` pair collapses onto `[1m]` as pinned models do. Rows the CLI marks "Draws from usage credits", plus Fable on non-Max plans per Anthropic's plan rule, carry a dim `· usage credits` note (`· usage credits · unpinned` on an unpinned row); nothing is hidden. If the handshake fails the pinned catalog below is used.
 

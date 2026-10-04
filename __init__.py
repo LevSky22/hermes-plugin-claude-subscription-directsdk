@@ -1,6 +1,7 @@
 """Claude Subscription DirectSDK (Experimental) — standalone Hermes model-provider registration."""
 import logging
 import os
+import shutil
 
 from providers import register_provider
 from providers.base import ProviderProfile
@@ -14,6 +15,11 @@ except ImportError:
     from directsdk_setup import INSTALL_HINT, _resolve
 
 logger = logging.getLogger(__name__)
+
+# Core checks `process_command` with a PATH-only `shutil.which` before this plugin is asked, so a CLI found only in
+# an install prefix is handed over as its absolute path; a PATH hit keeps the bare name and follows PATH.
+_found = _resolve(None, os.environ)
+_process_command = 'claude' if _found is None or shutil.which('claude') else _found[0]
 
 
 class ClaudeOAuthDirectSDKProfile(ProviderProfile):
@@ -97,7 +103,7 @@ profile = ClaudeOAuthDirectSDKProfile(
     native_reasoning_details_type='claude-subscription-directsdk-experimental.native_assistant',
     env_vars=(),
     base_url='process://claude-subscription-directsdk-experimental',
-    process_command='claude',
+    process_command=_process_command,
     process_args=(),
     process_command_env_vars=('CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND',),
     default_aux_model='claude-sonnet-5[1m]',
@@ -110,5 +116,5 @@ register_provider(profile)
 
 # The provider stays registered when Claude Code is missing so `hermes model` can show the
 # install hint; the request path (`directsdk.Client`) refuses with the same message.
-if _resolve(None, os.environ) is None:
+if _found is None:
     logger.warning("%s: %s", profile.display_name, INSTALL_HINT)

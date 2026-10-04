@@ -5,6 +5,76 @@ import os
 import sys
 import textwrap
 
+import pytest
+
+
+def _install(path):
+    binary = path / ("claude.exe" if os.name == "nt" else "claude")
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text("")
+    binary.chmod(0o755)
+    return binary
+
+
+def _service_env(tmp_path):
+    """A LaunchAgent/Desktop-spawned backend: the user's home, but a PATH that carries no install prefix."""
+    return {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path), "PATH": str(tmp_path / "empty")}
+
+
+@pytest.mark.parametrize("prefix", [".local/bin", ".claude/local", "bin", ".npm-global/bin", ".bun/bin", ".volta/bin"])
+def test_resolves_claude_outside_service_path(tmp_path, prefix):
+    from directsdk_setup import _resolve
+
+    binary = _install(tmp_path / prefix)
+    resolved = _resolve(["claude", "--verbose"], _service_env(tmp_path))
+    assert resolved is not None
+    assert os.path.normcase(resolved[0]) == os.path.normcase(str(binary))
+    assert resolved[1:] == ["--verbose"]
+
+
+def test_path_and_explicit_commands_take_precedence_over_the_probe(tmp_path):
+    from directsdk_setup import _resolve
+
+    _install(tmp_path / ".local/bin")
+    on_path = _install(tmp_path / "path-bin")
+    env = {**_service_env(tmp_path), "PATH": str(tmp_path / "path-bin")}
+    assert os.path.normcase(_resolve(None, env)[0]) == os.path.normcase(str(on_path))
+    override = str(tmp_path / ".local/bin" / on_path.name)
+    assert _resolve(None, {**env, "CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND": override}) == [override]
+    assert _resolve([str(tmp_path / "missing" / on_path.name)], env) is None
+    assert _resolve(["custom-claude-wrapper"], env) is None
+
+
+def test_core_finds_a_cli_that_is_only_in_an_install_prefix(tmp_path, monkeypatch):
+    """Core checks `process_command` with a PATH-only which() before the plugin runs (#32): the agent build of a
+    service-launched backend must not fail with "Could not find ... CLI command 'claude'"."""
+    import shutil
+    from pathlib import Path
+
+    import providers
+    from hermes_cli.auth import resolve_external_process_provider_credentials
+
+    binary = _install(tmp_path / ".local/bin")
+    monkeypatch.delenv("CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND", raising=False)
+    for key, value in _service_env(tmp_path).items():
+        monkeypatch.setenv(key, value)
+    # Install and discover the plugin under the service environment, as such a backend starting up would.
+    home = tmp_path / "hermes-home"
+    root = Path(__file__).resolve().parents[1]
+    shutil.copytree(root, home / "plugins" / "claude-subscription-directsdk-experimental",
+                    ignore=shutil.ignore_patterns(".git", "tests", "evals", "__pycache__"))
+    (home / "config.yaml").write_text("plugins:\n  enabled: []\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for name in tuple(sys.modules):
+        if name.startswith("_hermes_user_provider_"):
+            monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setattr(providers, "_REGISTRY", {})
+    monkeypatch.setattr(providers, "_ALIASES", {})
+    monkeypatch.setattr(providers, "_PROVIDER_LIST_CACHE", None)
+    monkeypatch.setattr(providers, "_discovered", False)
+    providers._discover_providers()
+    creds = resolve_external_process_provider_credentials("claude-subscription-directsdk-experimental")
+    assert os.path.normcase(creds["command"]) == os.path.normcase(str(binary))
 
 FAKE_CLI = textwrap.dedent('''
     import json, os, sys
