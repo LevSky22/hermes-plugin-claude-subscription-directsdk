@@ -752,6 +752,14 @@ class Client:
                            'reasoning_content': ''.join(b.get('thinking', '') for b in blocks if b.get('type') == 'thinking') or None}
                 carrier = {'type': CARRIER, 'version': 1, 'messages': assistants, 'projection': projection(message)}
                 message['reasoning_details'] = [carrier]
+                # An upstream refusal is Hermes' content_filter (as core's Anthropic transport maps it): terminal, one
+                # fallback try, never retried as an empty reply. Its reason rides stop_details, not a content block.
+                refused = not calls and any(a.get('stop_reason') == 'refusal' for a in assistants)
+                if refused:
+                    details = next((a['stop_details'] for a in assistants if isinstance(a.get('stop_details'), dict)), {})
+                    explanation, category = details.get('explanation'), details.get('category')
+                    message['refusal'] = (explanation.strip() if isinstance(explanation, str) and explanation.strip() else
+                                          f'provider refusal category: {category}' if isinstance(category, str) and category else None)
                 inp = usage['input_tokens'] + usage.get('cache_read_input_tokens', 0) + usage.get('cache_creation_input_tokens', 0)
                 normalized_usage = {'prompt_tokens': inp, 'completion_tokens': usage['output_tokens'], 'total_tokens': inp + usage['output_tokens'], 'prompt_tokens_details': {'cached_tokens': usage.get('cache_read_input_tokens', 0)}, 'cache_creation_input_tokens': usage.get('cache_creation_input_tokens', 0), 'native_usage': usage,
                                     'completion_tokens_details': {'reasoning_tokens': usage.get('output_tokens_details', {}).get('thinking_tokens', 0)},
@@ -759,9 +767,9 @@ class Client:
                 normalized_usage['native_admission'] = {'upstream_requests': int(admission.used), 'blocked_requests': admission.denied, 'request_id': admission.request_id}
                 if admission.unrestored:
                     normalized_usage['native_admission']['unrestored'] = admission.unrestored
-                finish = 'tool_calls' if calls else ('length' if any(a.get('stop_reason') in ('max_tokens', 'model_context_window_exceeded') for a in assistants) else 'stop')
+                finish = 'tool_calls' if calls else 'content_filter' if refused else ('length' if any(a.get('stop_reason') in ('max_tokens', 'model_context_window_exceeded') for a in assistants) else 'stop')
                 response = obj({'id': assistants[-1].get('id', 'claude-native'), 'model': kwargs['model'], 'object': 'chat.completion', 'choices': [{'index': 0, 'finish_reason': finish, 'message': message}], 'usage': normalized_usage})
-                chunk = self._chunk(kwargs['model'], {'content': None, 'tool_calls': [dict(tc, index=i) for i, tc in enumerate(calls)] or None, 'reasoning_details': [carrier]}, finish, normalized_usage)
+                chunk = self._chunk(kwargs['model'], {'content': None, 'tool_calls': [dict(tc, index=i) for i, tc in enumerate(calls)] or None, 'reasoning_details': [carrier], **({'refusal': message['refusal']} if refused else {})}, finish, normalized_usage)
                 chunk._response = response
                 yield chunk
         finally:

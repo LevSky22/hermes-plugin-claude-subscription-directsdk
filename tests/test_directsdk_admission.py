@@ -69,6 +69,46 @@ def test_first_response_owns_usage_and_stops_recovery(tmp_path, stop):
         client.close(); peer.shutdown(); thread.join(); peer.server_close()
 
 
+
+@pytest.mark.parametrize('details, refusal', [
+    ({'category': 'cyber', 'explanation': 'The request was declined.'}, 'The request was declined.'),
+    ({'category': 'cyber', 'explanation': None}, 'provider refusal category: cyber'),
+    (None, None),
+])
+def test_contentless_refusal_is_a_terminal_content_filter(tmp_path, details, refusal):
+    """A refusal carries no content block; as `stop` with no content Hermes would retry it as an empty reply (re-billing
+    the prompt each time). It is content_filter with stop_details' reason, through Hermes' own transport normalizer."""
+    from agent.transports import get_transport
+    usage = {'input_tokens':0, 'output_tokens':0, 'cache_read_input_tokens':0, 'cache_creation_input_tokens':0}
+    class Peer(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            self.send_response(200); self.send_header('Content-Type','text/event-stream'); self.end_headers()
+            delta = {'stop_reason':'refusal', **({'stop_details':details} if details else {})}
+            events = [
+                {'type':'message_start','message':{'id':'first','role':'assistant','model':'sonnet','content':[], 'usage':usage}},
+                {'type':'message_delta','delta':delta,'usage':usage},
+                {'type':'message_stop'},
+            ]
+            self.wfile.write(''.join('data: '+json.dumps(e)+'\n\n' for e in events).encode())
+    peer=ThreadingHTTPServer(('127.0.0.1',0),Peer)
+    thread=threading.Thread(target=peer.serve_forever,daemon=True); thread.start()
+    native=tmp_path/'native.py'; native.write_text(NATIVE)
+    client=directsdk.Client(command=[sys.executable,str(native)],env={'PATH':os.defpath,'HOME':str(tmp_path),'ANTHROPIC_BASE_URL':f'http://127.0.0.1:{peer.server_port}'})
+    try:
+        result=client.create(model='sonnet',messages=[{'role':'user','content':'fixture'}])
+        message=result.choices[0].message
+        assert result.choices[0].finish_reason=='content_filter'
+        assert message.content is None and message.refusal==refusal
+        assert message.reasoning_details[0]['messages'][0]['stop_reason']=='refusal'  # the signed native turn still replays
+        normalized=get_transport('chat_completions').normalize_response(result)
+        assert normalized.finish_reason=='content_filter' and normalized.content==refusal
+        last=list(client.create(model='sonnet',messages=[{'role':'user','content':'fixture'}],stream=True))[-1].choices[0]
+        assert last.finish_reason=='content_filter' and last.delta.refusal==refusal
+    finally:
+        client.close(); peer.shutdown(); thread.join(); peer.server_close()
+
 def test_empty_tool_input_completes_the_capture(tmp_path):
     """A no-argument tool call streams an empty input_json_delta; the capture must still complete."""
     calls = []
