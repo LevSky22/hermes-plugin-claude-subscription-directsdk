@@ -81,6 +81,7 @@ def test_contentless_refusal_is_a_terminal_content_filter(tmp_path, details, ref
     from agent.transports import get_transport
     usage = {'input_tokens':0, 'output_tokens':0, 'cache_read_input_tokens':0, 'cache_creation_input_tokens':0}
     class Peer(BaseHTTPRequestHandler):
+        extra = []
         def log_message(self, *args): pass
         def do_POST(self):
             self.rfile.read(int(self.headers['Content-Length']))
@@ -88,6 +89,7 @@ def test_contentless_refusal_is_a_terminal_content_filter(tmp_path, details, ref
             delta = {'stop_reason':'refusal', **({'stop_details':details} if details else {})}
             events = [
                 {'type':'message_start','message':{'id':'first','role':'assistant','model':'sonnet','content':[], 'usage':usage}},
+                *Peer.extra,
                 {'type':'message_delta','delta':delta,'usage':usage},
                 {'type':'message_stop'},
             ]
@@ -97,6 +99,16 @@ def test_contentless_refusal_is_a_terminal_content_filter(tmp_path, details, ref
     native=tmp_path/'native.py'; native.write_text(NATIVE)
     client=directsdk.Client(command=[sys.executable,str(native)],env={'PATH':os.defpath,'HOME':str(tmp_path),'ANTHROPIC_BASE_URL':f'http://127.0.0.1:{peer.server_port}'})
     try:
+        if details:
+            # A tool call the classifier cut off must not reach Hermes as tool_calls: Hermes would run it.
+            tools=[{'type':'function','function':{'name':'list_things','description':'list','parameters':{'type':'object','properties':{}}}}]
+            tool_use=[{'type':'content_block_start','index':0,'content_block':{'type':'tool_use','id':'toolu_1','name':'mcp__hermes__list_things','input':{}}},
+                      {'type':'content_block_delta','index':0,'delta':{'type':'input_json_delta','partial_json':''}},
+                      {'type':'content_block_stop','index':0}]
+            Peer.extra = tool_use
+            cut=client.create(model='sonnet',messages=[{'role':'user','content':'fixture'}],tools=tools)
+            Peer.extra = []
+            assert cut.choices[0].finish_reason=='content_filter' and cut.choices[0].message.refusal==refusal
         result=client.create(model='sonnet',messages=[{'role':'user','content':'fixture'}])
         message=result.choices[0].message
         assert result.choices[0].finish_reason=='content_filter'
