@@ -195,9 +195,10 @@ class Contract(unittest.TestCase):
     def test_fail_closed_and_cancellation(self):
         import directsdk
 
+        # `sonnet` resolves to Sonnet 5.5, which rejects the disable; Sonnet 5 accepts it.
         disabled = json.loads(
             directsdk.request_body(
-                {**self.request(), "extra_body": {"reasoning": {"enabled": False}}}
+                {**self.request(), "model": "claude-sonnet-5", "extra_body": {"reasoning": {"enabled": False}}}
             )[0]
         )
         self.assertEqual(disabled["thinking"], {"type": "disabled"})

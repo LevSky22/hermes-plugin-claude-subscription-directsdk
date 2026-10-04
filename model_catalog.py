@@ -1,5 +1,6 @@
 """Pinned native routes; a loopback gateway needs explicit long-context selection."""
 CONTEXT_WINDOWS = {
+    'claude-sonnet-5-5': 1_000_000,
     'claude-sonnet-5': 1_000_000,
     'claude-haiku-4-5-20251001': 200_000,
     'claude-opus-5-5': 1_000_000,
@@ -13,10 +14,11 @@ CONTEXT_WINDOWS = {
 # `thinking` and no effort (neither `output_config.effort` nor `--effort`), so the model thinks
 # at native's default effort. Opus 5.5 joined Fable: the docs say thinking cannot be turned off
 # there and the API answers the disable with the same 400 (#22). Plain Opus 5 still accepts it,
-# so the entry is the full `claude-opus-5-5` prefix.
-MANDATORY_THINKING = ('claude-fable', 'claude-opus-5-5')
+# so the entry is the full `claude-opus-5-5` prefix. Sonnet 5.5 rejects the disable too (its lowest
+# setting is `between_tools`); plain Sonnet 5 still accepts it.
+MANDATORY_THINKING = ('claude-fable', 'claude-opus-5-5', 'claude-sonnet-5-5')
 ALIASES = {
-    'sonnet': 'claude-sonnet-5',
+    'sonnet': 'claude-sonnet-5-5',
     'haiku': 'claude-haiku-4-5-20251001',
     'claude-haiku-4-5': 'claude-haiku-4-5-20251001',
     'opus': 'claude-opus-5-5',
