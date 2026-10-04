@@ -184,7 +184,7 @@ def test_admission_forwards_hermes_tool_result_without_native_email():
         peer.server_close()
 
 
-def test_admission_does_not_send_unmatched_tool_result_upstream():
+def test_admission_forwards_an_unmatched_tool_result_unchanged():
     received = []
 
     class Peer(BaseHTTPRequestHandler):
@@ -194,6 +194,7 @@ def test_admission_does_not_send_unmatched_tool_result_upstream():
         def do_POST(self):
             received.append(self.rfile.read(int(self.headers['Content-Length'])))
             self.send_response(200)
+            self.send_header('Content-Length', '0')
             self.end_headers()
 
     peer = ThreadingHTTPServer(('127.0.0.1', 0), Peer)
@@ -201,16 +202,16 @@ def test_admission_does_not_send_unmatched_tool_result_upstream():
     thread.start()
     gate = Admission(f'http://127.0.0.1:{peer.server_port}', 5, queried=[RESULT])
     changed = {**RESULT, 'tool_use_id': 'different'}
+    payload = wire([ASSISTANT, {'role': 'user', 'content': [changed]}])
     try:
         route = gate.url.removeprefix(f'http://127.0.0.1:{gate.server.server_port}') + '/v1/messages'
         conn = http.client.HTTPConnection('127.0.0.1', gate.server.server_port, timeout=5)
-        conn.request('POST', route, wire([ASSISTANT, {'role': 'user', 'content': [changed]}]),
-                     {'Content-Type': 'application/json'})
-        with pytest.raises(http.client.RemoteDisconnected):
-            conn.getresponse()
+        conn.request('POST', route, payload, {'Content-Type': 'application/json'})
+        conn.getresponse().read()
         conn.close()
-        assert gate.failure == 'Native request does not uniquely match Hermes tool results'
-        assert received == []
+        assert gate.unrestored == 'Native request does not uniquely match Hermes tool results'
+        assert gate.failure is None
+        assert received == [payload]
     finally:
         gate.close()
         peer.shutdown()

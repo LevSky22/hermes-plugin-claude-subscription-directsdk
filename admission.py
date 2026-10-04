@@ -316,6 +316,7 @@ class Admission:
         self.request_id = None
         self.status = None
         self.failure = None
+        self.unrestored = None
         self.capture = Capture()
         self.error_body = b''
         self.prefix = '/admit/' + secrets.token_urlsafe(32)
@@ -377,7 +378,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.connection.settimeout(gate.timeout)
             payload = self.rfile.read(int(self.headers['Content-Length']))
-            payload = restore_queried_turn(payload, gate.queried)
+            try:
+                payload = restore_queried_turn(payload, gate.queried)
+            except QueriedTurnMismatch as exc:
+                # Restoration is hygiene, not a gate: a frame it cannot prove lossless forwards
+                # exactly as native built it (the pre-restoration behaviour), so a CLI that
+                # reshapes its tool results degrades to an uncached tail, never a failed turn.
+                gate.unrestored = str(exc)
             payload = pin_message_breakpoint(payload, gate.queried)
             target = gate.upstream
             if target.scheme == 'https':
@@ -421,7 +428,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.flush()
         except (OSError, http.client.HTTPException, ValueError, KeyError, IndexError, TypeError) as exc:
-            gate.failure = str(exc) if isinstance(exc, QueriedTurnMismatch) else type(exc).__name__
+            gate.failure = type(exc).__name__
         finally:
             with gate.lock:
                 gate.sockets.discard(self.connection)

@@ -16,6 +16,14 @@ RESULT = {"type": "tool_result", "tool_use_id": "t1", "content": "output"}
 ASSISTANT = {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "probe", "input": {}}]}
 
 
+def strip(value):
+    if isinstance(value, dict):
+        return {k: strip(v) for k, v in value.items() if k != "cache_control"}
+    if isinstance(value, list):
+        return [strip(v) for v in value]
+    return value
+
+
 def wire(content, before=None, after=None):
     messages = list(before or [ASSISTANT]) + [{"role": "user", "content": content}] + list(after or [])
     return json.dumps({"model": "fixture", "messages": messages}, separators=(",", ":")).encode()
@@ -184,7 +192,7 @@ def test_plain_user_frame_is_byte_identical_after_successful_match():
     ([{**RESULT, "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
      [{**RESULT, "cache_control": {"type": "ephemeral", "ttl": "5m"}}]),
 ])
-def test_unsafe_content_is_rejected_at_admission_before_upstream(queried, native):
+def test_unprovable_restoration_forwards_the_native_payload_unchanged(queried, native):
     received = []
 
     class Peer(BaseHTTPRequestHandler):
@@ -212,8 +220,11 @@ def test_unsafe_content_is_rejected_at_admission_before_upstream(queried, native
             pass
         finally:
             conn.close()
-        assert gate.failure == "Native request does not uniquely match Hermes tool results"
-        assert received == []
+        assert gate.unrestored == "Native request does not uniquely match Hermes tool results"
+        assert gate.failure is None
+        # Nothing is dropped or rewritten: native's own frame goes upstream (only a marker may move).
+        assert len(received) == 1
+        assert strip(json.loads(received[0])) == strip(json.loads(wire(native)))
     finally:
         gate.close()
         peer.shutdown()
@@ -399,3 +410,14 @@ def test_nested_cache_marker_on_discarded_native_text_is_rejected():
     with pytest.raises(QueriedTurnMismatch):
         restore_queried_turn(wire([native]), [host])
 
+
+
+@pytest.mark.parametrize("annotation", [
+    "\n<system-reminder>\n# userEmail\nsomeone@example.invalid\n</system-reminder>",
+    "\nSession context: a wording no CLI has shipped yet",
+    "\n\nToday's date is 2031-01-01.",
+])
+def test_restoration_is_anchored_on_hermes_ids_and_content_not_native_wording(annotation):
+    native = [{**RESULT, "content": RESULT["content"] + annotation}]
+    restored = json.loads(restore_queried_turn(wire(native), [RESULT]))
+    assert restored["messages"][-1]["content"] == [RESULT]
