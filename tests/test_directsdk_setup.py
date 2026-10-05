@@ -91,7 +91,7 @@ def test_every_model_the_cli_advertises_is_selectable(profile, tmp_path):
 
 def test_pinned_models_the_picker_omits_stay_selectable(profile, tmp_path):
     """The live picker names only each family's current model; older pinned models the account
-    still runs (Opus 5, Opus 4.8, Opus 4.6) are appended after the advertised rows, never dropped."""
+    still runs (Opus 5, Opus 4.8) are appended after the advertised rows, never dropped."""
     from model_catalog import MODEL_METADATA
     models = _discover(profile, tmp_path, PINNED_PICKER + UNPINNED_PICKER)
     ids = [m["id"] for m in models]
@@ -107,6 +107,39 @@ def test_pinned_models_the_picker_omits_stay_selectable(profile, tmp_path):
     assert rows["claude-opus-5[1m]"]["label"] == "Opus 5"
     # Pro bills Fable to usage credits from the first request; the appended row says so too.
     assert rows["claude-fable-5-1[1m]"]["note"] == "usage credits"
+    assert all(m["upstream_requests"] == 0 for m in models)
+
+
+# What a CLI started with DISABLE_TELEMETRY / CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC advertises
+# (#86): its feature-flag fetch is off, so only each family's current model is offered. The plugin
+# keeps those flags for every child, discovery included, so the pinned table has to fill the gap.
+PRIVACY_PICKER = [
+    {"value": "opus", "resolvedModel": "claude-opus-5-5", "displayName": "Opus", "description": "Opus 5.5 · Best for everyday, complex tasks"},
+    {"value": "opus[1m]", "resolvedModel": "claude-opus-5-5[1m]", "displayName": "Opus (1M context)", "description": "Opus 5.5 with 1M context"},
+    {"value": "sonnet", "resolvedModel": "claude-sonnet-5", "displayName": "Sonnet", "description": "Sonnet 5 · Efficient for routine tasks"},
+    {"value": "fable", "resolvedModel": "claude-fable-5-1", "displayName": "Fable", "description": "Fable 5.1 · Most capable for your hardest tasks"},
+    # The undated alias id the CLI may report must land on the dated pinned route, not a second row.
+    {"value": "haiku", "resolvedModel": "claude-haiku-4-5", "displayName": "Haiku", "description": "Haiku 4.5 · Fastest for quick answers"},
+]
+
+
+def test_privacy_flags_shrunk_picker_is_unioned_with_the_pinned_table(profile, tmp_path):
+    """#86: the 5-row picker the privacy-flagged CLI returns is the floor, never the whole list. Every
+    advertised model comes first, then each pinned route it omitted, once per canonical model."""
+    from model_catalog import MODEL_METADATA
+    models = _discover(profile, tmp_path, PRIVACY_PICKER)
+    ids = [m["id"] for m in models]
+    advertised = ["claude-opus-5-5[1m]", "claude-sonnet-5[1m]", "claude-fable-5-1[1m]", "claude-haiku-4-5-20251001"]
+    assert ids[:len(advertised)] == advertised
+    assert set(ids) == set(advertised) | set(MODEL_METADATA)
+    assert {"claude-opus-5[1m]", "claude-opus-4-8[1m]"} <= set(ids[len(advertised):])
+    # No route twice and no canonical model twice (aliases and plain/[1m] pairs collapse).
+    assert len(ids) == len(set(ids))
+    canonical = [MODEL_METADATA[i]["canonical_model"] for i in ids]
+    assert len(canonical) == len(set(canonical))
+    # Opus 4.6 reaches 1M only via [1m], which bills usage credits on Pro and is not plan-checked
+    # behind our relay; the plugin must never offer that route on its own.
+    assert not any(i.startswith("claude-opus-4-6") for i in ids)
     assert all(m["upstream_requests"] == 0 for m in models)
 
 
