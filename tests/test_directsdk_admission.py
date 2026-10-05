@@ -376,7 +376,12 @@ def test_abort_closes_sockets_where_shutdown_cannot_wake_a_blocked_recv(monkeypa
 
 
 
-@pytest.mark.parametrize('close_flag', sorted({__import__('admission')._CANCEL_BY_CLOSE, True}))
+# The close path is production only on Windows; Linux exercises it too. Not macOS: its poll() can lose the
+# shutdown() wakeup when the fd is closed under a waiting reader, which then sleeps out the 30 s socket timeout.
+_CLOSE_FLAGS = sorted({__import__('admission')._CANCEL_BY_CLOSE} | (set() if sys.platform == 'darwin' else {True}))
+
+
+@pytest.mark.parametrize('close_flag', _CLOSE_FLAGS)
 def test_abort_wakes_a_real_getresponse_blocked_on_a_silent_upstream(monkeypatch, close_flag):
     """A real http.client read (which holds makefile() refs, so socket.close() alone never reaches the OS)
     blocked on an upstream that accepts and never answers must end promptly after abort()."""
