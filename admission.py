@@ -104,6 +104,13 @@ def pin_message_breakpoint(payload, queried):
     tool_result (parallel calls, native's reminder on the last result), a breakpoint on the
     unchanged results before it measured no cache hit even though they replay byte-identical
     (#33, cause unknown), so the span ends at the preceding assistant message.
+    Claude Code 2.1.287+ marks two message blocks from the second request on: the last
+    tool_use of the turn and its trailing per-request ``role: system`` message (#33). That
+    message never recurs, so its entry is never read and each round is written twice. Marks
+    after the span are therefore folded into one on its last block; a native mark inside the
+    span recurs and stays. The breakpoint count never grows (Anthropic allows four across
+    tools, system and messages), system and tools marks are never touched, and the moved
+    marker keeps native's own order of TTLs.
     The breakpoint never moves later, content never changes, and any payload that does not
     parse forwards as is."""
     if not queried:
@@ -115,7 +122,7 @@ def pin_message_breakpoint(payload, queried):
         blocks = [(i, j, b) for i, m in enumerate(messages) if isinstance(m.get('content'), list)
                   for j, b in enumerate(m['content'])]
         marked = [(i, j, b) for i, j, b in blocks if isinstance(b, dict) and 'cache_control' in b]
-        if len(marked) != 1:
+        if not marked:
             return payload
         last = max((i for i, m in enumerate(messages) if m.get('role') == 'assistant'), default=-1)
         stable = [(i, j, b) for i, j, b in blocks if i <= last]
@@ -131,9 +138,10 @@ def pin_message_breakpoint(payload, queried):
                 stable += prefix
         target = next(((i, j, b) for i, j, b in reversed(stable)
                        if isinstance(b, dict) and b.get('type') not in UNCACHEABLE), None)
-        i, j, block = marked[0]
-        if target is not None and (target[0], target[1]) < (i, j):
-            target[2]['cache_control'] = block.pop('cache_control')
+        after = [b for i, j, b in marked if target is not None and (target[0], target[1]) < (i, j)]
+        if target is not None and after:
+            moved = [b.pop('cache_control') for b in after][0]
+            target[2].setdefault('cache_control', moved)
         elif not reordered:
             return payload
         return json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
