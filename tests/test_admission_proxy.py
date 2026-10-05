@@ -74,11 +74,12 @@ def test_loopback_http_fixture_never_uses_the_proxy(clean_proxy_env):
 
 @pytest.mark.parametrize('url', ['socks5://user:hunter2@proxy.test:1080', 'https://user:hunter2@proxy.test:8443',
                                  'http://user:hunter2@proxy.test:notaport'])
-def test_unsupported_proxy_fails_clearly_without_leaking_credentials(clean_proxy_env, url):
+def test_unsupported_proxy_connects_directly_without_leaking_credentials(clean_proxy_env, url, caplog):
+    """An unusable proxy keeps the pre-proxy behavior (direct connection) instead of breaking the relay."""
     clean_proxy_env.setenv('HTTPS_PROXY', url)
-    with pytest.raises(ValueError, match='CONNECT proxy') as excinfo:
-        Admission('https://api.example.com', 1)
-    assert 'hunter2' not in str(excinfo.value)
+    with caplog.at_level('WARNING'):
+        assert Admission('https://api.example.com', 1).proxy is None
+    assert 'CONNECT proxy' in caplog.text and 'hunter2' not in caplog.text
 
 
 def test_authenticated_connect_tunnels_to_the_upstream_host(clean_proxy_env):

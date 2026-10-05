@@ -6,6 +6,7 @@ import http.client
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import ipaddress
 import json
+import logging
 import re
 import secrets
 import socket
@@ -155,9 +156,13 @@ def upstream_proxy(upstream):
         port = proxy.port or 80
     except ValueError:
         port = None
-    # Messages never quote the URL: it may carry proxy credentials.
+    # Before proxy support the relay always connected directly; an unusable proxy keeps that rather
+    # than breaking a setup that worked. The message never quotes the URL: it may carry credentials.
     if proxy.scheme != 'http' or not proxy.hostname or port is None:
-        raise ValueError('HTTPS_PROXY must be an http://host[:port] CONNECT proxy (SOCKS and TLS-to-proxy are not supported)')
+        logging.getLogger(__name__).warning(
+            'ignoring HTTPS_PROXY for the relay: only an http://host[:port] CONNECT proxy is supported '
+            '(SOCKS and TLS-to-proxy are not); connecting directly')
+        return None
     headers = None
     if proxy.username is not None:
         credentials = unquote(proxy.username) + ':' + unquote(proxy.password or '')
