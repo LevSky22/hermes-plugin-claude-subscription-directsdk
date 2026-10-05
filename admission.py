@@ -1,4 +1,5 @@
 """Request-scoped native HTTP admission; credentials are forwarded, never persisted."""
+import base64
 import codecs
 import copy
 import http.client
@@ -10,7 +11,8 @@ import secrets
 import socket
 import ssl
 import threading
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
+import urllib.request
 
 
 UNCACHEABLE = ('thinking', 'redacted_thinking')
@@ -130,6 +132,39 @@ class Capture:
         self.complete = bool(self.message and self.message.get('stop_reason') and not self.arguments)
 
 
+def upstream_proxy(upstream):
+    """``(host, port, tunnel_headers)`` of the HTTP CONNECT proxy for ``upstream``, or ``None``.
+
+    The relay opens the upstream connection itself, so native's own proxy handling never runs;
+    honor the same variables with the standard library's rules: ``https_proxy``/``HTTPS_PROXY``
+    then ``http_proxy``/``HTTP_PROXY`` (lowercase wins, as for native), ``NO_PROXY`` exceptions.
+    A proxy is only a CONNECT tunnel: TLS and certificate checks still end at the upstream host.
+    """
+    if upstream.scheme != 'https':
+        return None
+    proxies = urllib.request.getproxies_environment()
+    if 'no' in proxies:
+        proxies['no'] = proxies['no'].replace(' ', ',')  # native also accepts space-separated entries
+    if urllib.request.proxy_bypass_environment(f'{upstream.hostname}:{upstream.port or 443}', proxies):
+        return None
+    raw = proxies.get('https') or proxies.get('http')
+    if not raw:
+        return None
+    proxy = urlsplit(raw if '://' in raw else 'http://' + raw)
+    try:
+        port = proxy.port or 80
+    except ValueError:
+        port = None
+    # Messages never quote the URL: it may carry proxy credentials.
+    if proxy.scheme != 'http' or not proxy.hostname or port is None:
+        raise ValueError('HTTPS_PROXY must be an http://host[:port] CONNECT proxy (SOCKS and TLS-to-proxy are not supported)')
+    headers = None
+    if proxy.username is not None:
+        credentials = unquote(proxy.username) + ':' + unquote(proxy.password or '')
+        headers = {'Proxy-Authorization': 'Basic ' + base64.b64encode(credentials.encode()).decode()}
+    return proxy.hostname, port, headers
+
+
 class Admission:
     def __init__(self, upstream, timeout, queried=None):
         self.upstream = urlsplit(upstream)
@@ -142,6 +177,7 @@ class Admission:
         if (self.upstream.scheme != 'https' and not (self.upstream.scheme == 'http' and local)) or not host or self.upstream.username or self.upstream.password or self.upstream.query or self.upstream.fragment:
             raise ValueError('Native upstream must be HTTPS or a loopback HTTP fixture')
         self.timeout = timeout
+        self.proxy = upstream_proxy(self.upstream)
         self.lock = threading.Lock()
         self.sockets = set()
         self.cancelled = False
@@ -214,7 +250,12 @@ class Handler(BaseHTTPRequestHandler):
             payload = pin_message_breakpoint(payload, gate.queried)
             target = gate.upstream
             if target.scheme == 'https':
-                conn = http.client.HTTPSConnection(target.hostname, target.port, timeout=gate.timeout, context=ssl.create_default_context())
+                if gate.proxy:
+                    proxy_host, proxy_port, tunnel_headers = gate.proxy
+                    conn = http.client.HTTPSConnection(proxy_host, proxy_port, timeout=gate.timeout, context=ssl.create_default_context())
+                    conn.set_tunnel(target.hostname, target.port or 443, headers=tunnel_headers)
+                else:
+                    conn = http.client.HTTPSConnection(target.hostname, target.port, timeout=gate.timeout, context=ssl.create_default_context())
             else:
                 conn = http.client.HTTPConnection(target.hostname, target.port, timeout=gate.timeout)
             conn.connect()
