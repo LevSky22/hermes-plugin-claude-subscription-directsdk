@@ -121,6 +121,109 @@ def test_contentless_refusal_is_a_terminal_content_filter(tmp_path, details, ref
     finally:
         client.close(); peer.shutdown(); thread.join(); peer.server_close()
 
+
+def _hermes_reply(response):
+    """What Hermes shows the user for a content_filter response: core's own refusal handler, no fallback configured."""
+    from types import SimpleNamespace
+    from agent.transports import get_transport
+    from agent.turn_retry_state import TurnRetryState
+    from agent.turn_truncation import handle_content_policy_refusal
+    noop = lambda *a, **k: None
+    agent = SimpleNamespace(
+        api_mode='chat_completions', provider='claude-subscription-directsdk', model='sonnet', log_prefix='',
+        thinking_callback=None, _get_transport=lambda: get_transport('chat_completions'),
+        _extract_reasoning=lambda message: getattr(message, 'reasoning', None),
+        _invoke_api_request_error_hook=noop, _has_pending_fallback=lambda: False, _try_activate_fallback=lambda: False,
+        _buffer_diagnostic_status=noop, _flush_status_buffer=noop, _emit_diagnostic_status=noop,
+        _cleanup_task_resources=noop, _persist_session=noop)
+    verdict = handle_content_policy_refusal(
+        agent, response, TurnRetryState(), thinking_spinner=None, messages=[], api_messages=[], api_kwargs={},
+        active_system_prompt=None, conversation_history=None, api_call_count=1, effective_task_id=None, turn_id=None,
+        api_request_id=None, api_start_time=0.0, retry_count=0, max_retries=3)
+    assert verdict.action == 'return'
+    return verdict.result['final_response']
+
+
+def _hermes_stream_response(chunks):
+    """Assemble streamed chunks the way Hermes' chat-completions stream loop does (its tool-call accumulator,
+    delta.refusal collection and _finish_chat_stream), so the test reads what core would act on."""
+    from types import SimpleNamespace
+    from agent.chat_completion_helpers import _StreamingCall, _ToolCallAccumulator
+    content, refusal, finish, acc = [], [], None, _ToolCallAccumulator()
+    for chunk in chunks:
+        choice = chunk.choices[0]
+        finish = choice.finish_reason or finish
+        delta = choice.delta
+        if delta.content:
+            content.append(delta.content)
+        if isinstance(getattr(delta, 'refusal', None), str) and delta.refusal:
+            refusal.append(delta.refusal)
+        for tc in delta.tool_calls or ():
+            acc.feed(tc)
+    owner = SimpleNamespace(agent=SimpleNamespace(), _assemble_tool_calls=_StreamingCall._assemble_tool_calls)
+    return _StreamingCall._finish_chat_stream(
+        owner, SimpleNamespace(response=None), 'assistant', content, [], acc.materialize(), finish, 'sonnet', None,
+        flush_pending=lambda: None, refusal_parts=refusal)
+
+
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('details, refusal', [
+    ({'category': 'cyber', 'explanation': 'The request was declined.'}, 'The request was declined.'),
+    ({'category': 'cyber', 'explanation': None}, 'provider refusal category: cyber'),
+])
+def test_refusal_after_a_tool_call_reaches_the_user(tmp_path, stream, details, refusal):
+    """Claude refuses after it started a tool call. Hermes must not run the cut-off call AND must show the refusal's
+    reason. With the call left in tool_calls Hermes' normalizer keeps content empty (a refusal is promoted only when
+    it is the sole payload) and the user reads "the model returned no explanation"."""
+    from agent.transports import get_transport
+    usage = {'input_tokens':0, 'output_tokens':0, 'cache_read_input_tokens':0, 'cache_creation_input_tokens':0}
+    class Peer(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            self.send_response(200); self.send_header('Content-Type','text/event-stream'); self.end_headers()
+            events = [
+                {'type':'message_start','message':{'id':'first','role':'assistant','model':'sonnet','content':[], 'usage':usage}},
+                {'type':'content_block_start','index':0,'content_block':{'type':'tool_use','id':'toolu_1','name':'mcp__hermes__list_things','input':{}}},
+                {'type':'content_block_delta','index':0,'delta':{'type':'input_json_delta','partial_json':''}},
+                {'type':'content_block_stop','index':0},
+                {'type':'message_delta','delta':{'stop_reason':'refusal','stop_details':details},'usage':usage},
+                {'type':'message_stop'},
+            ]
+            self.wfile.write(''.join('data: '+json.dumps(e)+'\n\n' for e in events).encode())
+    peer=ThreadingHTTPServer(('127.0.0.1',0),Peer)
+    thread=threading.Thread(target=peer.serve_forever,daemon=True); thread.start()
+    native=tmp_path/'native.py'; native.write_text(NATIVE)
+    client=directsdk.Client(command=[sys.executable,str(native)],env={'PATH':os.defpath,'HOME':str(tmp_path),'ANTHROPIC_BASE_URL':f'http://127.0.0.1:{peer.server_port}'})
+    tools=[{'type':'function','function':{'name':'list_things','description':'list','parameters':{'type':'object','properties':{}}}}]
+    try:
+        request = dict(model='sonnet', messages=[{'role':'user','content':'fixture'}], tools=tools)
+        if stream:
+            chunks = list(client.create(**request, stream=True))
+            last = chunks[-1].choices[0]
+            assert last.finish_reason == 'content_filter' and last.delta.refusal == refusal
+            assert not any(c.choices[0].delta.tool_calls for c in chunks)  # nothing for Hermes to run
+            carrier = last.delta.reasoning_details[0]
+            response = _hermes_stream_response(chunks)
+        else:
+            response = client.create(**request)
+            message = response.choices[0].message
+            assert response.choices[0].finish_reason == 'content_filter' and message.refusal == refusal
+            assert not message.tool_calls  # nothing for Hermes to run
+            carrier = message.reasoning_details[0]
+        # The signed native turn is kept whole, refused tool_use included.
+        native_turn = carrier['messages'][0]
+        assert native_turn['stop_reason'] == 'refusal'
+        assert [b['type'] for b in native_turn['content']] == ['tool_use'] and native_turn['content'][0]['id'] == 'toolu_1'
+        normalized = get_transport('chat_completions').normalize_response(response)
+        assert normalized.finish_reason == 'content_filter' and not normalized.tool_calls and normalized.content == refusal
+        shown = _hermes_reply(response)
+        assert shown.endswith('Provider said: ' + refusal)
+        assert 'no explanation' not in shown
+    finally:
+        client.close(); peer.shutdown(); thread.join(); peer.server_close()
+
+
 def test_empty_tool_input_completes_the_capture(tmp_path):
     """A no-argument tool call streams an empty input_json_delta; the capture must still complete."""
     calls = []

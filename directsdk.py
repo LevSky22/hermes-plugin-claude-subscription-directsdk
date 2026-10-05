@@ -769,6 +769,10 @@ class Client:
                     explanation, category = details.get('explanation'), details.get('category')
                     message['refusal'] = (explanation.strip() if isinstance(explanation, str) and explanation.strip() else
                                           f'provider refusal category: {category}' if isinstance(category, str) and category else None)
+                    # The cut-off call stays out of what Hermes acts on: Hermes promotes a refusal to the text it shows
+                    # only when nothing else is in the message, so with the call kept the user read "no explanation".
+                    # The carrier above still holds native's turn as sent, refused tool_use included.
+                    message['tool_calls'], calls = None, []
                 inp = usage['input_tokens'] + usage.get('cache_read_input_tokens', 0) + usage.get('cache_creation_input_tokens', 0)
                 normalized_usage = {'prompt_tokens': inp, 'completion_tokens': usage['output_tokens'], 'total_tokens': inp + usage['output_tokens'], 'prompt_tokens_details': {'cached_tokens': usage.get('cache_read_input_tokens', 0)}, 'cache_creation_input_tokens': usage.get('cache_creation_input_tokens', 0), 'native_usage': usage,
                                     'completion_tokens_details': {'reasoning_tokens': usage.get('output_tokens_details', {}).get('thinking_tokens', 0)},
