@@ -81,6 +81,16 @@ Auxiliary/fallback routing remains owned by Hermes. Configure those routes expli
 
 The relay opens the upstream connection itself, so it applies native's proxy variables from the Hermes process environment: `https_proxy`/`HTTPS_PROXY`, then `http_proxy`/`HTTP_PROXY`, with `NO_PROXY` exceptions (standard-library matching; comma- or space-separated). The proxy must be an `http://` CONNECT proxy; `user:pass@` in its URL becomes a `Proxy-Authorization` header. TLS still terminates at `api.anthropic.com`, so the subscription bearer never reaches the proxy. A SOCKS or TLS-to-proxy URL is ignored with a warning and the relay connects directly, as it did before proxy support.
 
+## Settings
+
+**Claude Code telemetry and feature flags** (`claude_code_telemetry`, on by default). Claude Code sends its usage telemetry and fetches feature flags; the flags are what unlock newer and older models in its model picker, so with them off the picker can shrink from every model your account runs to each family's current one (#86). Turn it off to keep Claude Code quiet: the plugin then starts it with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `DISABLE_TELEMETRY` and `DISABLE_ERROR_REPORTING` set, and the pinned model table fills in the picker. Change it in the Desktop app under **Capabilities → Plugins**: the settings gear on the `claude-subscription-directsdk-experimental` row opens the switch. Or from the CLI:
+
+```sh
+hermes config set plugins.entries.claude-subscription-directsdk-experimental.settings.claude_code_telemetry false
+```
+
+It is read for the active profile on every spawn, so it applies to the next request without a restart. Whatever the setting, the plugin never lets the CLI auto-update itself or use its feedback upload path (`DISABLE_AUTOUPDATER`, `DISABLE_FEEDBACK_COMMAND`), and an opt-out you export yourself (`DISABLE_TELEMETRY`, `DO_NOT_TRACK`, ...) is passed through untouched.
+
 ## Ownership and replay
 
 Each `chat.completions.create` starts a fresh process in a private temporary directory. Native tools, skills and setting sources are disabled. MCP advertises only the current Hermes tool inventory, has inert callbacks, and is denied execution by native `dontAsk`. Full descriptions and schemas are supplied through tools plus validated generation fields in `CLAUDE_CODE_EXTRA_BODY`, applied from a private native settings file; the system prompt uses a private file too. This avoids the OS per-argument/environment-string limit. Authentication and identity fields are never replaced.
