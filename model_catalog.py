@@ -2,6 +2,7 @@
 CONTEXT_WINDOWS = {
     'claude-sonnet-5-5': 1_000_000,
     'claude-sonnet-5': 1_000_000,
+    'claude-haiku-5-5': 1_000_000,
     'claude-haiku-4-5-20251001': 200_000,
     'claude-opus-5-5': 1_000_000,
     'claude-opus-5': 1_000_000,
@@ -15,11 +16,12 @@ CONTEXT_WINDOWS = {
 # at native's default effort. Opus 5.5 joined Fable: the docs say thinking cannot be turned off
 # there and the API answers the disable with the same 400 (#22). Plain Opus 5 still accepts it,
 # so the entry is the full `claude-opus-5-5` prefix. Sonnet 5.5 rejects the disable too (its lowest
-# setting is `between_tools`); plain Sonnet 5 still accepts it.
-MANDATORY_THINKING = ('claude-fable', 'claude-opus-5-5', 'claude-sonnet-5-5')
+# setting is `between_tools`); plain Sonnet 5 still accepts it. The docs say thinking cannot be
+# turned off on Haiku 5.5 either; Haiku 4.5 still accepts the disable.
+MANDATORY_THINKING = ('claude-fable', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5')
 ALIASES = {
     'sonnet': 'claude-sonnet-5-5',
-    'haiku': 'claude-haiku-4-5-20251001',
+    'haiku': 'claude-haiku-5-5',
     'claude-haiku-4-5': 'claude-haiku-4-5-20251001',
     'opus': 'claude-opus-5-5',
     'fable': 'claude-fable-5-1',
