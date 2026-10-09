@@ -11,6 +11,7 @@ import os
 import sys
 import textwrap
 import time
+from pathlib import Path
 
 FAKE_CLI = textwrap.dedent('''
     import json, os, sys, time
@@ -18,7 +19,7 @@ FAKE_CLI = textwrap.dedent('''
     config = os.environ["CLAUDE_CONFIG_DIR"]
     lock = os.path.join(config, ".oauth_refresh.lock")
     def log(event):
-        with open(os.environ["FAKE_LOG"], "a") as f:
+        with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as f:
             f.write(json.dumps({"event": event, "lock": os.path.exists(lock)}) + "\\n")
     if sys.argv[1:3] == ["auth", "status"]:
         log("auth-status")
@@ -34,9 +35,9 @@ FAKE_CLI = textwrap.dedent('''
             sys.exit(1)
         path = os.path.join(config, ".credentials.json")
         if os.path.exists(path):
-            creds = json.load(open(path))
+            creds = json.load(open(path, encoding="utf-8"))
             creds["claudeAiOauth"]["expiresAt"] = int(time.time() * 1000) + 8 * 3600 * 1000
-            json.dump(creds, open(path, "w"))
+            json.dump(creds, open(path, "w", encoding="utf-8"))
         print("Current week (all models): 1% used"); sys.exit(0)
     sys.exit(f"unexpected argv {sys.argv}")
 ''')
@@ -52,13 +53,13 @@ def _setup(tmp_path, *, expires_in=None, usage="refresh", lock=None, auth=PRO):
     if expires_in is not None:
         creds = {"claudeAiOauth": {"accessToken": "a", "refreshToken": "r",
                                    "expiresAt": int((time.time() + expires_in) * 1000)}}
-        (config / ".credentials.json").write_text(json.dumps(creds))
+        (config / ".credentials.json").write_text(json.dumps(creds), encoding="utf-8")
     if lock is not None:
         (config / ".oauth_refresh.lock").mkdir()
         stamp = time.time() - lock
         os.utime(config / ".oauth_refresh.lock", (stamp, stamp))
     cli = tmp_path / "claude.py"
-    cli.write_text(FAKE_CLI)
+    cli.write_text(FAKE_CLI, encoding="utf-8")
     log = tmp_path / "calls.jsonl"
     env = {**os.environ, "PATH": os.defpath, "CLAUDE_CONFIG_DIR": str(config), "FAKE_LOG": str(log),
            "FAKE_STATE": json.dumps({"auth": auth, "usage": usage})}
@@ -66,11 +67,11 @@ def _setup(tmp_path, *, expires_in=None, usage="refresh", lock=None, auth=PRO):
 
 
 def _calls(log):
-    return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
 
 
 def _expires_at(config):
-    return json.loads((config / ".credentials.json").read_text())["claudeAiOauth"]["expiresAt"]
+    return json.loads((config / ".credentials.json").read_text(encoding="utf-8"))["claudeAiOauth"]["expiresAt"]
 
 
 def test_expired_login_is_renewed_before_auth_status(profile, tmp_path):
@@ -120,8 +121,20 @@ def test_a_live_refresh_lock_is_never_reaped(profile, tmp_path):
 
 def test_a_lock_with_contents_is_never_reaped(profile, tmp_path):
     command, env, config, _ = _setup(tmp_path, expires_in=3600, lock=120)
-    (config / ".oauth_refresh.lock" / "owner").write_text("pid")
+    (config / ".oauth_refresh.lock" / "owner").write_text("pid", encoding="utf-8")
     stamp = time.time() - 120
     os.utime(config / ".oauth_refresh.lock", (stamp, stamp))
     profile.setup_status(command=command, env=env)
     assert (config / ".oauth_refresh.lock" / "owner").exists()
+
+
+def test_config_dir_follows_the_cli_home_rules():
+    """Claude Code resolves ~ with Node's os.homedir(): %USERPROFILE% on Windows even when a Git Bash or MSYS
+    shell sets HOME elsewhere, so reaping under $HOME there would miss the real lock."""
+    from directsdk_setup import _config_dir
+
+    env = {"HOME": "/msys/home/user", "USERPROFILE": "C:/Users/user"}
+    assert _config_dir(env, windows=True) == Path("C:/Users/user") / ".claude"
+    assert _config_dir(env, windows=False) == Path("/msys/home/user") / ".claude"
+    assert _config_dir({**env, "CLAUDE_CONFIG_DIR": "/cfg"}, windows=True) == Path("/cfg")
+    assert _config_dir({**env, "CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR": "/own"}, windows=False) == Path("/own")

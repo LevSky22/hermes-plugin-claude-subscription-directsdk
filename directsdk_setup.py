@@ -112,11 +112,13 @@ def _child_env(env):
 _REFRESH_LOCK_STALE_S = 60
 
 
-def _config_dir(env):
+def _config_dir(env, windows=os.name == "nt"):
+    """Claude Code's config dir: CLAUDE_CONFIG_DIR, else ``~/.claude`` with Node's ``os.homedir()`` rules
+    (%USERPROFILE% on Windows even when a Git Bash or MSYS shell sets HOME elsewhere; HOME everywhere else)."""
     config = env.get("CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR") or env.get("CLAUDE_CONFIG_DIR")
     if config:
         return Path(config).expanduser()
-    home = env.get("HOME") or env.get("USERPROFILE")
+    home = (env.get("USERPROFILE") or env.get("HOME")) if windows else env.get("HOME")
     return (Path(home) if home else Path.home()) / ".claude"
 
 
