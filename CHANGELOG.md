@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Setup probes no longer strand Claude Code's OAuth refresh: `claude -p /usage` lets a due refresh land before `auth status`, which exits before it does (anthropics/claude-code#95822), and an empty `.oauth_refresh.lock` older than Claude Code's 60 s stale window is removed from the child's config dir (the profile's `claude_config_dir` when set) before probes, `/usage` and native requests, since Claude Code never reclaims it (anthropics/claude-code#95236).
 - Keep one native session per conversation (`--session-id` from the system prompt and first frame): with feature flags on, native names a per-session scratchpad directory in the environment message after the first user turn, so a new session per spawn changed it on every request and each round re-wrote the conversation to the prompt cache.
 - Short model names such as `sonnet-5-5`, `sonnet-5.5`, `opus-4.8` and `haiku-4-5` resolve to their pinned routes (and thinking policy) instead of reaching Claude Code verbatim and 404ing into the fallback chain (#103).
 - `/usage` asks Claude Code for the plan limits (`get_usage` control request) instead of reading its login: it now works with `auth.adopt_external_logins: false`, follows the per-profile `claude_config_dir`, and the plugin never holds the CLI's token (#82).
