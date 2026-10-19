@@ -12,12 +12,17 @@ import re
 import secrets
 import socket
 import ssl
+import sys
 import threading
 from urllib.parse import unquote, urlsplit
 import urllib.request
 
 
 UNCACHEABLE = ('thinking', 'redacted_thinking')
+# Anthropic's cache lookup checks at most this many positions back from a breakpoint, the breakpoint
+# itself included, and allows this many breakpoints across tools, system and messages.
+LOOKBACK = 20
+MAX_BREAKPOINTS = 4
 # Longest byte silence after the headers before the stream counts as dead. Anthropic documents no ping
 # cadence ("any number of ping events"); this is native's own byte-level watchdog against api.anthropic.com
 # (180 s, native 2.1.263-2.1.286). Behind this relay native widens its watchdog to 300 s, the same as Hermes'
@@ -58,6 +63,19 @@ def _plain(block):
     return {k: v for k, v in block.items() if k != 'cache_control'} if isinstance(block, dict) else block
 
 
+def _breakpoints(value):
+    """Every ``cache_control`` in ``value``: nested ones (tool_result content) and a top-level one included."""
+    count, pending = 0, [value]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, dict):
+            count += 'cache_control' in node
+            pending += (v for k, v in node.items() if k != 'cache_control')
+        elif isinstance(node, list):
+            pending += node
+    return count
+
+
 def _frame_first(messages, queried):
     """Put Hermes' first user turn ahead of the context native prepends to it (#77).
 
@@ -90,8 +108,141 @@ def _frame_first(messages, queried):
     return True
 
 
+# The only trailing system text the relay moves: native 2.1.299's date line, exactly as its opening request ends the
+# environment message. Any other trailing text stays put, since moving text that varies per request into the
+# environment message would change the prefix from message 1 on every request.
+_DATE_LINE = re.compile(r"Today's date is \d{4}-\d{2}-\d{2}\.")
+
+
+def stable_request_context(payload, queried):
+    """Keep native's per-request context in the prefix later per-call requests replay.
+
+    Native splits today's date out of the environment into a trailing system message
+    and prepends reminders to the newest user frame. Neither position recurs when
+    signed thinking is replayed (#40), and new user turns lose their cache prefix (#36).
+    Append that date line (no other trailing text) after two newlines to the first system
+    message, keeping a string a string; drop only plain text before the whole queried frame,
+    found exactly once, on later user turns, which native already omits from tool-result steps. Removed cache markers move with setdefault, never multiply.
+    Warm sessions skip this transform at the relay. Assistant text/thinking, tool-result-only
+    turns, opening-turn reminders and top-level system/tools are never touched.
+    An already-stable or unexpectedly shaped payload forwards unchanged."""
+    try:
+        body = json.loads(payload)
+        messages = body['messages']
+        if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+            return payload
+        for message in messages:
+            content = message['content']
+            if message.get('role') not in ('system', 'user', 'assistant') or not isinstance(content, (str, list)):
+                return payload
+            if isinstance(content, list) and any(not isinstance(b, dict) or not isinstance(b.get('type'), str)
+                    or (b['type'] == 'text' and not isinstance(b.get('text'), str)) for b in content):
+                return payload
+        if queried is not None and (not isinstance(queried, list) or any(not isinstance(b, dict) for b in queried)):
+            return payload
+        changed = False
+        last = messages[-1] if messages else {}
+        env = next((m for m in messages[:-1] if m.get('role') == 'system'), None)
+        content = last.get('content')
+        tail = {'type': 'text', 'text': content} if isinstance(content, str) else (
+            content[0] if isinstance(content, list) and len(content) == 1 else {})
+        if last.get('role') == 'system' and env is not None and tail.get('type') == 'text' \
+                and _DATE_LINE.fullmatch(tail.get('text', '')):
+            original, line = env['content'], '\n\n' + tail['text']
+            target = {'type': 'text', 'text': original} if isinstance(original, str) else (original[-1] if original else {})
+            if target.get('type') == 'text' and not target['text'].endswith(tail['text']):
+                if isinstance(original, str):
+                    env['content'] = original + line
+                else:
+                    target['text'] += line
+                mark = tail.get('cache_control', last.get('cache_control'))
+                messages.pop()
+                previous = messages[-1]['content']
+                if mark is not None and isinstance(previous, list) and previous:
+                    previous[-1].setdefault('cache_control', mark)
+                changed = True
+        newest = next((m for m in reversed(messages) if m.get('role') == 'user'), {})
+        blocks = newest.get('content')
+        if queried and any(b.get('type') != 'tool_result' for b in queried) and isinstance(blocks, list) \
+                and any(m.get('role') == 'assistant' for m in messages):
+            frame = [_plain(b) for b in queried]
+            hits = [i for i in range(len(blocks) - len(frame) + 1) if [_plain(b) for b in blocks[i:i + len(frame)]] == frame]
+            k = hits[0] if len(hits) == 1 else None
+            if k and all(b.get('type') == 'text' and set(b) <= {'type', 'text', 'cache_control'} for b in blocks[:k]):
+                mark = next((b['cache_control'] for b in blocks[:k] if 'cache_control' in b), None)
+                del blocks[:k]
+                if mark is not None:
+                    blocks[0].setdefault('cache_control', mark)
+                changed = True
+        return json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode('utf-8') if changed else payload
+    except (ValueError, TypeError, KeyError, AttributeError, IndexError):
+        return payload
+
+
+def _opens_turn(message):
+    """A user message carrying anything but tool results: a new turn, or a /steer row after them."""
+    content = message.get('content')
+    return message.get('role') == 'user' and (isinstance(content, str) or any(
+        not isinstance(b, dict) or b.get('type') != 'tool_result' for b in content or []))
+
+
+def _keep_turn_mark(body, messages, last, target):
+    """Keep a breakpoint where the open turn's thinking starts, so the next turn still reads it (#122).
+
+    Once a user message carries more than tool results (the next turn, or a /steer row), the
+    entries written after the open turn's first thinking block stop matching; #122's captures
+    read back only the newest entry written before it, by the turn's first call or by the call
+    whose answer first thought. Anthropic's lookup walks back at most LOOKBACK positions from a
+    breakpoint, so after a longer loop the recurring breakpoint cannot reach that entry and the
+    read falls back to tools and system: the whole conversation is written again. Out of that
+    reach, the block carries a mark of its own, which reads the entry an earlier request of the
+    turn wrote there (as its recurring breakpoint) and keeps it alive through the loop.
+
+    The open turn starts at the latest user message with more than tool results before the last
+    assistant message; the mark goes on the last cacheable block of the user message right
+    before the turn's first assistant message with thinking. Distance is counted per block,
+    without the API's merging of tool_use and tool_result runs, so an error only marks early.
+    The mark takes the TTL of the next mark after it, so native's order of TTLs holds. It is
+    added only while the request stays within MAX_BREAKPOINTS, counting every marker in the body
+    (a host marker restoration carried into tool_result content takes a slot too); at the limit
+    (2.1.287+ marks two message blocks) a native mark between it and the marked recurring
+    breakpoint moves there instead, and otherwise nothing changes. Returns whether a mark was placed."""
+    opening = max((i for i in range(last) if _opens_turn(messages[i])), default=None)
+    if opening is None:
+        return False
+    thought = next((i for i in range(opening + 1, last + 1) if messages[i].get('role') == 'assistant'
+                    and isinstance(messages[i].get('content'), list)
+                    and any(isinstance(b, dict) and b.get('type') in UNCACHEABLE for b in messages[i]['content'])), None)
+    if thought is None:
+        return False
+    frame = next((i for i in range(thought - 1, opening, -1) if messages[i].get('role') == 'user'), opening)
+    content = messages[frame].get('content')
+    if not isinstance(content, list):
+        return False
+    j = next((k for k in reversed(range(len(content)))
+              if isinstance(content[k], dict) and content[k].get('type') not in UNCACHEABLE), None)
+    if j is None or 'cache_control' in content[j] or (frame, j) >= target[:2]:
+        return False
+    span = sum(len(m['content']) if isinstance(m.get('content'), list) else 1 for m in messages[frame:target[0]])
+    if span - j + target[1] + 1 <= LOOKBACK:
+        return False  # The recurring breakpoint's own lookback still reaches it.
+    marks = [(i, k, b) for i, m in enumerate(messages) if isinstance(m.get('content'), list)
+             for k, b in enumerate(m['content']) if isinstance(b, dict) and 'cache_control' in b]
+    later = [(i, k, b) for i, k, b in marks if (frame, j) < (i, k)]
+    if not later:
+        return False
+    if _breakpoints(body) < MAX_BREAKPOINTS:
+        content[j]['cache_control'] = copy.deepcopy(later[0][2]['cache_control'])
+        return True
+    spare = next((b for i, k, b in later if (i, k) < target[:2]), None)
+    if spare is None or 'cache_control' not in target[2]:
+        return False
+    content[j]['cache_control'] = spare.pop('cache_control')
+    return True
+
+
 def pin_message_breakpoint(payload, queried):
-    """Keep the single message ``cache_control`` on content the next request replays unchanged.
+    """Keep the recurring message ``cache_control`` on content the next request replays unchanged.
 
     Native attaches per-request context (today's date, the account-email reminder, whatever a
     later CLI adds) to the turn it answers and puts the message breakpoint on or after it. The
@@ -108,8 +259,10 @@ def pin_message_breakpoint(payload, queried):
     tool_use of the turn and its trailing per-request ``role: system`` message (#33). That
     message never recurs, so its entry is never read and each round is written twice. Marks
     after the span are therefore folded into one on its last block; a native mark inside the
-    span recurs and stays. The breakpoint count never grows (Anthropic allows four across
-    tools, system and messages), system and tools marks are never touched, and the moved
+    span recurs and stays. After a tool loop longer than the cache lookback, one more mark
+    keeps the open turn's start readable for the next turn (``_keep_turn_mark``, #122).
+    The count grows by at most that one mark and only within Anthropic's four across tools,
+    system and messages; system and tools marks are never touched, and a moved or added
     marker keeps native's own order of TTLs.
     The breakpoint never moves later, content never changes, and any payload that does not
     parse forwards as is."""
@@ -139,13 +292,40 @@ def pin_message_breakpoint(payload, queried):
         target = next(((i, j, b) for i, j, b in reversed(stable)
                        if isinstance(b, dict) and b.get('type') not in UNCACHEABLE), None)
         after = [b for i, j, b in marked if target is not None and (target[0], target[1]) < (i, j)]
-        if target is not None and after:
+        folded = target is not None and bool(after)
+        if folded:
             moved = [b.pop('cache_control') for b in after][0]
             target[2].setdefault('cache_control', moved)
-        elif not reordered:
+        turn = target is not None and _keep_turn_mark(body, messages, last, target)
+        if not (reordered or folded or turn):
             return payload
         return json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
     except (ValueError, TypeError, KeyError, AttributeError, IndexError):
+        return payload
+
+
+def drop_message_breakpoints(payload):
+    """Remove native's message ``cache_control`` marks from a tool-less one-shot.
+
+    Hermes' auxiliary calls (compression summaries, titles) send one user turn and no tools, and
+    nothing replays that turn: each summary carries a different transcript and, for LCM-style
+    summarizers, a per-call nonce. Native still marks the turn for its 1-hour cache, so every such
+    call paid a cache write (2x input) that no later request read. Message marks go; system and
+    tools marks stay, so a stable system prompt is still cached across calls. Content never
+    changes, and a payload that does not parse forwards as is."""
+    try:
+        body = json.loads(payload)
+        dropped = False
+        for message in body['messages']:
+            content = message.get('content')
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.pop('cache_control', None) is not None:
+                        dropped = True
+        if not dropped:
+            return payload
+        return json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    except (ValueError, TypeError, KeyError, AttributeError):
         return payload
 
 
@@ -368,6 +548,25 @@ def upstream_proxy(upstream):
     return proxy.hostname, port, headers
 
 
+class _Server(HTTPServer):
+    """HTTPServer that stays quiet about a client that hung up before reading our answer.
+
+    Native (Bun's own HTTP client) sends a throwaway warm-up probe (observed as a GET/HEAD to
+    an `/api/hello`-style path) ahead of the real `/v1/messages` POST on every turn. Handler only
+    implements do_POST, so http.server's default dispatch answers the probe with a 501
+    ("Unsupported method") via send_error(); native never reads that body and disconnects
+    immediately, so the write raises BrokenPipeError/ConnectionResetError while send_error() is
+    still writing it. The 501 itself is expected and harmless to the real request (see the
+    archived hermes-plugin-claude-subscription-directsdk#17); the only bug worth fixing is
+    socketserver's default handle_error() dumping a scary-looking traceback to stderr for this
+    exact, harmless, every-turn race. Anything else still gets the real traceback.
+    """
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
+
 class Admission:
     def __init__(self, upstream, timeout, queried=None):
         self.upstream = urlsplit(upstream)
@@ -393,7 +592,7 @@ class Admission:
         self.capture = Capture()
         self.error_body = b''
         self.prefix = '/admit/' + secrets.token_urlsafe(32)
-        self.server = HTTPServer(('127.0.0.1', 0), Handler)
+        self.server = _Server(('127.0.0.1', 0), Handler)
         self.server.admission = self
         self.url = f'http://127.0.0.1:{self.server.server_port}' + self.prefix
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={'poll_interval':.05}, daemon=True)
@@ -433,6 +632,28 @@ class Admission:
 
 
 class Handler(BaseHTTPRequestHandler):
+    def setup(self):
+        gate = self.server.admission
+        with gate.lock:
+            gate.sockets.add(self.request)
+            cancelled = gate.cancelled
+        try:
+            self.request.settimeout(gate.timeout)
+            if cancelled:
+                self.request.shutdown(socket.SHUT_RDWR)
+            super().setup()
+        except BaseException:
+            with gate.lock:
+                gate.sockets.discard(self.request)
+            raise
+
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            with self.server.admission.lock:
+                self.server.admission.sockets.discard(self.request)
+
     def log_message(self, *args):
         pass  # Native authorization and the per-call route must never enter logs.
 
@@ -453,12 +674,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
                 return
             gate.used = True
-            gate.sockets.add(self.connection)
         conn = None
         upstream_socket = None
         try:
             self.connection.settimeout(gate.timeout)
             payload = self.rfile.read(int(self.headers['Content-Length']))
+            if getattr(gate, 'one_shot', False):
+                payload = drop_message_breakpoints(payload)
             try:
                 payload = restore_queried_turn(payload, gate.queried)
             except QueriedTurnMismatch as exc:
@@ -466,6 +688,7 @@ class Handler(BaseHTTPRequestHandler):
                 # exactly as native built it (the pre-restoration behaviour), so a CLI that
                 # reshapes its tool results degrades to an uncached tail, never a failed turn.
                 gate.unrestored = str(exc)
+            payload = stable_request_context(payload, gate.queried)
             payload = pin_message_breakpoint(payload, gate.queried)
             target = gate.upstream
             if target.scheme == 'https':
@@ -518,7 +741,6 @@ class Handler(BaseHTTPRequestHandler):
             gate.failure = type(exc).__name__
         finally:
             with gate.lock:
-                gate.sockets.discard(self.connection)
                 gate.sockets.discard(upstream_socket)
             if conn:
                 conn.close()

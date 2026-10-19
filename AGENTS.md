@@ -1,4 +1,4 @@
-# hermes-plugin-claude-subscription-directsdk — agent rules
+# claude-subscription-directsdk (hermes-official-plugins) — agent rules
 
 Standalone Hermes model-provider plugin: Hermes talks to a native Claude Code child over a
 loopback relay, on the user's Claude subscription. `model_catalog.py` is the pinned route table,
@@ -51,7 +51,7 @@ window and which plans include it; the model table for the minimum CLI version).
 
 `hermes plugins update claude-subscription-directsdk` follows the pin in
 `NousResearch/hermes-agent:plugin-catalog/claude-subscription-directsdk.yaml`, not this repo's
-main. Only `hermes plugins install NousResearch/hermes-plugin-claude-subscription-directsdk`
+main. Only `hermes plugins install NousResearch/hermes-official-plugins#claude-subscription-directsdk`
 tracks main. So after every merge here that changes routing, windows, thinking policy or
 admission:
 
@@ -75,7 +75,7 @@ HERMES_AGENT_REPO=~/.hermes/hermes-agent python -m pytest -q
 ```
 
 CI runs the suite on ubuntu, macOS and Windows. Gate a merge on
-`gh pr checks <n> --repo NousResearch/hermes-plugin-claude-subscription-directsdk` exiting 0
+`gh pr checks <n> --repo NousResearch/hermes-official-plugins` exiting 0
 (8 = still pending), never on a `statusCheckRollup` grep: lanes that have not started have no
 row, so "no pending rows" reads ubuntu-passed as all-green while macOS and Windows are queued.
 After the train, `gh run watch <id> --exit-status` on main.

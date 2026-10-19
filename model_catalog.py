@@ -31,8 +31,31 @@ ALIASES = {
 NO_ADAPTIVE_THINKING = frozenset({'claude-haiku-4-5-20251001'})
 
 
+def _route_base(base):
+    """The catalogued id a short name points at, or the name unchanged when it points at none.
+
+    `sonnet-5-5` and `sonnet-5.5` both name `claude-sonnet-5-5`; without this they are sent to the
+    CLI as typed and the CLI 404s. A name that matches nothing is returned as typed, so an unknown
+    route still reaches the CLI and fails there instead of being guessed at.
+    """
+    if base in ALIASES or base in CONTEXT_WINDOWS:
+        return base
+    dotted = base.replace('.', '-')
+    if dotted != base:
+        return _route_base(dotted)
+    without_vendor = base.removeprefix('claude-')
+    # `haiku-4-5` names the `claude-haiku-4-5` alias, not a pinned id, so check both tables.
+    if 'claude-' + without_vendor in CONTEXT_WINDOWS or 'claude-' + without_vendor in ALIASES:
+        return 'claude-' + without_vendor
+    return base
+
+
 def native_model(model):
     base = model.removesuffix('[1m]')
+    # A short name that names a pinned route must land on it. `sonnet` does, but `sonnet-5-5` and
+    # `sonnet-5.5` do not: they miss ALIASES, so the route is sent to the CLI verbatim and the CLI
+    # answers 404. A 404 is a hard failure, so Hermes abandons the provider and falls back.
+    base = _route_base(base)
     canonical = ALIASES.get(base, base)
     window = CONTEXT_WINDOWS.get(canonical)
     if window == 1_000_000:
@@ -46,14 +69,14 @@ def native_model(model):
 
 def accepts_thinking_disable(model):
     # Same tolerance as supports_adaptive_thinking: an absent model still reaches `model is required`.
-    base = model.removesuffix('[1m]') if isinstance(model, str) else ''
+    base = _route_base(model.removesuffix('[1m]')) if isinstance(model, str) else ''
     return not ALIASES.get(base, base).startswith(MANDATORY_THINKING)
 
 
 def supports_adaptive_thinking(model):
     # Body assembly precedes model validation, so an absent or invalid route answers True
     # and still reaches the existing `model is required` error.
-    base = model.removesuffix('[1m]') if isinstance(model, str) else ''
+    base = _route_base(model.removesuffix('[1m]')) if isinstance(model, str) else ''
     return ALIASES.get(base, base) not in NO_ADAPTIVE_THINKING
 
 

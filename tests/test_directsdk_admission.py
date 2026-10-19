@@ -148,7 +148,11 @@ def _hermes_stream_response(chunks):
     """Assemble streamed chunks the way Hermes' chat-completions stream loop does (its tool-call accumulator,
     delta.refusal collection and _finish_chat_stream), so the test reads what core would act on."""
     from types import SimpleNamespace
-    from agent.chat_completion_helpers import _StreamingCall, _ToolCallAccumulator
+    from agent.chat_completion_helpers import _StreamingCall
+    try:  # core moved the accumulator into its own module (hermes-agent 208fd6e)
+        from agent.chat_completion_helpers_tool_calls import _ToolCallAccumulator
+    except ImportError:
+        from agent.chat_completion_helpers import _ToolCallAccumulator
     content, refusal, finish, acc = [], [], None, _ToolCallAccumulator()
     for chunk in chunks:
         choice = chunk.choices[0]

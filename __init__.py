@@ -24,7 +24,6 @@ _found = _resolve(None, os.environ)
 _process_command = 'claude' if _found is None or shutil.which('claude') else _found[0]
 
 
-USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 # A `limits[]` kind maps to a fixed label; a model-scoped limit reads "<model> week" (Fable's own
 # weekly limit); any other kind keeps its raw name so a new limit still shows.
 LIMIT_LABELS = {'session': 'Current session', 'weekly_all': 'Current week'}
@@ -50,7 +49,7 @@ def _reset_at(value):
 
 
 def usage_windows(payload):
-    """`/api/oauth/usage` body -> (windows, detail lines). Untrusted shapes degrade, never raise."""
+    """Plan-limits body (Claude Code's `get_usage` `rate_limits`, the `/api/oauth/usage` shape) -> (windows, detail lines). Untrusted shapes degrade, never raise."""
     from agent.account_usage import AccountUsageWindow
     limits = payload.get('limits')
     limits = [entry for entry in limits if isinstance(entry, dict)] if isinstance(limits, list) else []
@@ -77,26 +76,6 @@ def usage_windows(payload):
     details = [f"Extra usage: {spent:.2f} / {cap:.2f} {extra.get('currency') or 'USD'}"] if (
         extra.get('is_enabled') and spent is not None and cap is not None) else []
     return windows, details
-
-
-def _subscription_token():
-    """The OAuth token native runs on, read-only: `CLAUDE_CODE_OAUTH_TOKEN`, else the Claude Code login.
-
-    Never core's `resolve_anthropic_token`: it refreshes an expired login, and Claude's refresh
-    tokens are single-use, so a refresh here would race native's own and can log the user out.
-    """
-    from agent.anthropic_credentials import is_claude_code_token_valid, read_claude_code_credentials
-    token = os.environ.get('CLAUDE_CODE_OAUTH_TOKEN', '').strip()
-    if token:
-        return token, None
-    creds = read_claude_code_credentials()
-    if not creds or not creds.get('accessToken'):
-        return None, 'no Claude Code login found (run `claude` and log in)'
-    try:
-        valid = is_claude_code_token_valid(creds)
-    except (TypeError, ValueError):
-        valid = False
-    return (creds['accessToken'], None) if valid else (None, 'token expired (run `claude` once to refresh)')
 
 
 class ClaudeOAuthDirectSDKProfile(ProviderProfile):
@@ -157,39 +136,27 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
             from directsdk_setup import discover_models
         return discover_models(**kwargs)
 
-    def build_api_kwargs_extras(self, *, reasoning_config=None, **_):
-        return ({'reasoning': dict(reasoning_config)} if reasoning_config else {}), {}
+    def build_api_kwargs_extras(self, *, reasoning_config=None, **context):
+        extra = {'reasoning': dict(reasoning_config)} if reasoning_config else {}
+        # Hermes' auxiliary calls (call_llm: compression summaries, titles) reach this hook without the
+        # conversation context its chat path always passes (session_id). Mark them so the client can skip
+        # a message cache write that no later request would read.
+        auxiliary = context.get('task') is not None or 'session_id' not in context
+        return extra, ({'hermes_auxiliary': True} if auxiliary else {})
 
     def fetch_account_usage(self, *, base_url=None, api_key=None):
-        """`/usage` plan limits: one GET, and every failure is an `Unavailable:` line, never a raise."""
-        import httpx
+        """`/usage` plan limits, asked of Claude Code itself; every failure is an `Unavailable:` line, never a raise."""
         from agent.account_usage import AccountUsageSnapshot
-
-        def snapshot(windows=(), details=(), reason=None):
-            return AccountUsageSnapshot(provider=self.name, source='oauth_usage_api', fetched_at=datetime.now(timezone.utc),
-                                        title='Claude plan limits', windows=tuple(windows), details=tuple(details),
-                                        unavailable_reason=reason)
-
-        token, reason = _subscription_token()
-        if not token:
-            return snapshot(reason=reason)
-        headers = {'Authorization': f'Bearer {token}', 'anthropic-beta': 'oauth-2025-04-20',
-                   'Accept': 'application/json', 'User-Agent': 'claude-code/2.1.0'}
         try:
-            # Under core's 10 s hook deadline, so a slow API still prints a reason.
-            with httpx.Client(timeout=8.0) as client:
-                response = client.get(USAGE_URL, headers=headers)
-        except httpx.HTTPError:
-            return snapshot(reason='could not reach the usage API')
-        if response.status_code in (401, 403):
-            return snapshot(reason='token rejected (run `claude` once to refresh)')
-        if not 200 <= response.status_code < 300:
-            return snapshot(reason=f'usage API returned HTTP {response.status_code}')
-        try:
-            payload = response.json()
-        except ValueError:
-            return snapshot(reason='usage API returned an unreadable response')
-        return snapshot(*usage_windows(payload if isinstance(payload, dict) else {}))
+            from .directsdk_setup import fetch_usage
+        except ImportError:
+            from directsdk_setup import fetch_usage
+
+        limits, reason = fetch_usage()
+        windows, details = usage_windows(limits) if limits is not None else ((), ())
+        return AccountUsageSnapshot(provider=self.name, source='claude_code_get_usage', fetched_at=datetime.now(timezone.utc),
+                                    title='Claude plan limits', windows=tuple(windows), details=tuple(details),
+                                    unavailable_reason=reason)
 
 
 def classify_api_error(error, **_):

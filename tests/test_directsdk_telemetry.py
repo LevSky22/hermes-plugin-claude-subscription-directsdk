@@ -85,6 +85,21 @@ def test_explicit_true_matches_the_default(profile, tmp_path, child):
     assert all(not set(QUIET) & set(env) for env in envs)
 
 
+@pytest.mark.parametrize("value", [None, "false"])
+@pytest.mark.parametrize("child", ["discovery", "turn"])
+def test_native_never_sends_its_own_session_title_request(profile, tmp_path, monkeypatch, child, value):
+    """#116: inherited from an Agent SDK or a non-CLI entrypoint, native races the turn for the one admission with a
+    session-title request. The plugin switches that request off on every child, whatever the setting."""
+    monkeypatch.delenv("CLAUDE_CODE_DISABLE_TERMINAL_TITLE", raising=False)  # a developer's own export must not pass it
+    if value:
+        _set_telemetry(value)
+    inherited = {"CLAUDE_CODE_ENTRYPOINT": "sdk-py", "CLAUDE_AGENT_SDK_VERSION": "0.1.0"}
+    envs = (_discovery_envs(profile, tmp_path, **inherited) if child == "discovery"
+            else [_turn_env(profile, tmp_path, **inherited)])
+    for env in envs:
+        assert env.get("CLAUDE_CODE_DISABLE_TERMINAL_TITLE") == "1"
+
+
 @pytest.mark.parametrize("child", ["discovery", "turn"])
 def test_a_users_own_opt_out_is_never_stripped(profile, tmp_path, child):
     flags = {"DISABLE_TELEMETRY": "1", "DO_NOT_TRACK": "1"}
@@ -124,6 +139,7 @@ def test_manifest_declares_the_setting_under_the_key_the_code_reads():
     import directsdk_setup
     root = Path(directsdk_setup.__file__).resolve().parent
     assert directsdk_setup.PLUGIN_ID == PLUGIN_NAME
-    (field,) = plugin_settings_fields(PLUGIN_NAME, root)
+    (field,) = [field for field in plugin_settings_fields(PLUGIN_NAME, root)
+               if field["key"] == directsdk_setup.TELEMETRY_SETTING]
     assert field["key"] == directsdk_setup.TELEMETRY_SETTING
     assert field["type"] == "boolean" and field["default"] is True

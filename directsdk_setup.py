@@ -25,7 +25,8 @@ INSTALL_HINT = ("Claude Code is not installed (no `claude` on PATH or in the usu
 LOGIN_HINT = "Claude Code is installed but not logged in. Run `claude auth login`, then select this provider again."
 LOGGED_OUT_HINT = ("Claude Code is installed but has no usable login in the environment Hermes runs it in. Run `claude auth login` "
                    "as the user Hermes runs as, set CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) in Hermes' environment, "
-                   "or point CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR at a logged-in config directory, then try again.")
+                   "or point the claude_config_dir plugin setting (or CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR) "
+                   "at a logged-in config directory, then try again.")
 
 
 # Install prefixes probed after PATH, as core's anthropic_adapter does: a service or GUI launch (macOS
@@ -54,19 +55,22 @@ def _resolve(command, env):
 # config.yaml (plugin.yaml `config_schema`; Desktop → Capabilities → Plugins, or `hermes config set`).
 PLUGIN_ID = "claude-subscription-directsdk-experimental"
 TELEMETRY_SETTING = "claude_code_telemetry"
+CONFIG_DIR_SETTING = "claude_config_dir"
 # Any one of these turns off Claude Code's feature-flag fetch, and with it every model its picker
 # only offers through a flag (#86: 11 models become 5). Off only when the user turns the setting off.
 QUIET_TRAFFIC = {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_TELEMETRY": "1", "DISABLE_ERROR_REPORTING": "1"}
 # Never wanted from a child the plugin starts, setting or not: a background self-update of the
 # user's CLI mid-session, and the feedback path (/feedback, /bug, /share, Claude-drafted feedback)
 # that uploads a session to Anthropic. Neither gates feature flags. DISABLE_FEEDBACK_COMMAND is the
-# current name of DISABLE_BUG_COMMAND, which the CLI still accepts.
-ALWAYS_QUIET = {"DISABLE_AUTOUPDATER": "1", "DISABLE_FEEDBACK_COMMAND": "1"}
+# current name of DISABLE_BUG_COMMAND, which the CLI still accepts. CLAUDE_CODE_DISABLE_TERMINAL_TITLE
+# also stops native's own session-title request (#116): under an inherited Agent SDK or non-CLI
+# entrypoint, or a server flag, it races the turn for the one upstream request the relay admits.
+ALWAYS_QUIET = {"DISABLE_AUTOUPDATER": "1", "DISABLE_FEEDBACK_COMMAND": "1", "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"}
 _OFF = ("false", "0", "no", "off")
 
 
-def telemetry_enabled():
-    """The ``claude_code_telemetry`` plugin setting, default on.
+def _setting(key, default=None):
+    """Read one plugin setting, with unreadable config or missing keys treated as not set.
 
     Read from the active profile's config on every call (``load_config_readonly`` resolves
     ``get_hermes_home()`` per call and caches on the file signature), so a multi-profile gateway
@@ -76,14 +80,30 @@ def telemetry_enabled():
         from hermes_cli.config import load_config_readonly
         value = load_config_readonly()
     except Exception:
-        return True
-    for segment in ("plugins", "entries", PLUGIN_ID, "settings", TELEMETRY_SETTING):
+        return default
+    for segment in ("plugins", "entries", PLUGIN_ID, "settings", key):
         if not isinstance(value, Mapping) or segment not in value:
-            return True
+            return default
         value = value[segment]
+    return value
+
+
+def telemetry_enabled():
+    """The active profile's ``claude_code_telemetry`` plugin setting, default on."""
+    value = _setting(TELEMETRY_SETTING, True)
     if isinstance(value, str):
         return value.strip().lower() not in _OFF
     return value is not False and value != 0
+
+
+def apply_config_dir(env):
+    """Select the active profile's Claude config directory on a child env, in place."""
+    override = env.pop("CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR", None)
+    setting = _setting(CONFIG_DIR_SETTING)
+    config = (setting.strip() if isinstance(setting, str) else "") or override or env.get("CLAUDE_CONFIG_DIR")
+    if config:
+        env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(config)
+    return env
 
 
 def apply_traffic_policy(env, telemetry=None):
@@ -100,9 +120,7 @@ def apply_traffic_policy(env, telemetry=None):
 
 def _child_env(env):
     child = dict(env)
-    config = child.pop("CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR", None)
-    if config:
-        child["CLAUDE_CONFIG_DIR"] = config
+    apply_config_dir(child)
     return apply_traffic_policy(child)
 
 
@@ -208,6 +226,53 @@ def discover_models(command=None, env=None, timeout=40):
                          "note": "usage credits" if canonical in credit_billed_on_plan else "",
                          "upstream_requests": upstream}
     return list(routes.values())
+
+
+def fetch_usage(command=None, env=None, timeout=8):
+    """``(rate_limits, None)`` from Claude Code's own ``get_usage`` control request, else ``(None, reason)``.
+
+    The CLI fetches the plan limits with the login it already holds, so the plugin never reads or
+    sends that token (catalog rule 11) and ``auth.adopt_external_logins: false`` keeps meaning what
+    it says. It follows the same per-profile config dir as every native spawn, runs behind an unused
+    admission gate (zero inference), and fits under core's 10 s ``/usage`` hook deadline.
+    """
+    env = dict(env if env is not None else os.environ)
+    resolved = _resolve(command, env)
+    if resolved is None:
+        return None, INSTALL_HINT
+    child = _child_env(env)
+    gate = Admission("https://api.anthropic.com", timeout)
+    try:
+        child["ANTHROPIC_BASE_URL"] = gate.url
+        argv = resolved + ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+                           "--tools", "", "--setting-sources", "", "--strict-mcp-config", "--mcp-config",
+                           '{"mcpServers":{}}', "--disable-slash-commands", "--no-session-persistence"]
+        request = json.dumps({"type": "control_request", "request_id": "hermes-usage",
+                              "request": {"subtype": "get_usage", "skip_behaviors": True}}) + "\n"
+        with tempfile.TemporaryDirectory(prefix="claude-directsdk-usage-") as cwd:
+            run = subprocess.run(argv, input=request, env=child, cwd=cwd, capture_output=True,
+                                 text=True, encoding="utf-8", errors="replace", timeout=timeout)
+        rows = [json.loads(line) for line in run.stdout.splitlines() if line.startswith("{")]
+        response = next(r["response"] for r in rows if r.get("type") == "control_response"
+                        and r.get("response", {}).get("request_id") == "hermes-usage")
+    except subprocess.TimeoutExpired:
+        return None, "Claude Code did not answer in time"
+    except (OSError, ValueError, StopIteration, KeyError, AttributeError, subprocess.SubprocessError):
+        return None, "Claude Code gave no usage answer (needs a version with get_usage)"
+    finally:
+        gate.close()
+    if response.get("subtype") != "success":
+        return None, "Claude Code refused the usage request (needs a version with get_usage)"
+    body = response.get("response") if isinstance(response.get("response"), dict) else {}
+    limits = body.get("rate_limits")
+    if isinstance(limits, dict):
+        return limits, None
+    if not body.get("rate_limits_available"):
+        return None, "no Claude subscription login found (run `claude` and log in)"
+    if child.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"):
+        # Measured on 2.1.302: with nonessential traffic off the CLI answers rate_limits: null.
+        return None, "Claude Code skips the usage fetch with nonessential traffic off (claude_code_telemetry)"
+    return None, "Claude Code returned no plan limits"
 
 
 def _catalog_label(model):

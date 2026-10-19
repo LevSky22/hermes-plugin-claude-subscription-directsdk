@@ -80,3 +80,20 @@ print(json.dumps({'type':'result','subtype':'success','usage':{'input_tokens':1,
         assert not client._requests
     finally:
         client.close()
+
+
+def test_replayed_carrier_drops_native_usage_so_compression_does_not_trip_the_local_size_gate():
+    """#92: native gates each request locally on the newest assistant message's `usage`. A replayed
+    carrier kept the usage of the request that produced it, so right after Hermes compressed the history
+    native still saw the pre-compression size and refused with "Prompt is too long" without sending.
+    `usage` is local metadata (never part of the wire request), so the replay drops it."""
+    usage = {"input_tokens": 158258, "output_tokens": 900, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+    msg = {"role": "assistant", "content": "Done."}
+    natives = [{"id": "msg_1", "role": "assistant", "content": [{"type": "text", "text": "Done."}], "usage": usage, "stop_reason": "end_turn"}]
+    msg["reasoning_details"] = [{"type": native.CARRIER, "version": 1, "projection": native.projection(msg), "messages": natives}]
+    history = [{"role": "user", "content": "go"}, msg, {"role": "user", "content": "STILL IN PROGRESS"}]
+    original = copy.deepcopy(history)
+    frame = native.prepare_history(history)[1][1]["message"]
+    assert "usage" not in frame
+    assert frame == {k: v for k, v in natives[0].items() if k != "usage"}
+    assert history == original  # the stored carrier keeps its usage; only the replayed copy drops it

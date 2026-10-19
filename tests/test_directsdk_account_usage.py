@@ -1,6 +1,10 @@
-"""`/usage` plan limits through core's own dispatch and renderer; only the HTTP call and the
-Claude Code credential read are faked."""
-from datetime import datetime, timedelta, timezone
+"""`/usage` plan limits through core's own dispatch and renderer. Claude Code answers its `get_usage`
+control request; only that subprocess is faked. The plugin never reads or sends the CLI's token."""
+from datetime import datetime, timezone
+import json
+import subprocess
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,54 +21,35 @@ LEGACY = {'five_hour': {'utilization': 0.4, 'resets_at': '2026-10-01T07:09:00Z'}
           'extra_usage': {'is_enabled': True, 'used_credits': 1.5, 'monthly_limit': 10, 'currency': 'EUR'}}
 
 
-def _creds(expires_in):
-    return {'accessToken': 'login-token', 'refreshToken': 'r',
-            'expiresAt': int((datetime.now(timezone.utc) + expires_in).timestamp() * 1000)}
-
-
-class Response:
-    def __init__(self, status, payload):
-        self.status_code, self.payload = status, payload
-
-    def json(self):
-        if isinstance(self.payload, Exception):
-            raise self.payload
-        return self.payload
+def _answer(rate_limits=None, available=True, subtype='success'):
+    return {'type': 'control_response', 'response': {'subtype': subtype, 'request_id': 'hermes-usage', 'response': {
+        'subscription_type': 'max' if available else None, 'rate_limits_available': available,
+        'rate_limits': rate_limits, 'session': {}, 'behaviors': None}}}
 
 
 @pytest.fixture
-def api(profile, monkeypatch):
-    """Answers every GET with `api.reply`; `api.requests` records them."""
-    import httpx
+def cli(profile, monkeypatch):
+    """A fake Claude Code: `cli.reply` is its control answer; `cli.calls` records argv/env/stdin."""
     import agent.anthropic_credentials as credentials
 
     class State:
-        reply, requests, creds = Response(200, LIMITS), [], _creds(timedelta(hours=1))
+        reply, calls = _answer(LIMITS), []
 
-    class Client:
-        def __init__(self, *, timeout):
-            assert timeout < 10  # inside core's hook deadline
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            return False
-
-        def get(self, url, headers):
-            State.requests.append((url, headers))
-            if isinstance(State.reply, Exception):
-                raise State.reply
-            return State.reply
+    def run(argv, **kwargs):
+        State.calls.append(SimpleNamespace(argv=argv, env=kwargs['env'], input=kwargs.get('input'), timeout=kwargs.get('timeout')))
+        if isinstance(State.reply, Exception):
+            raise State.reply
+        out = State.reply if isinstance(State.reply, str) else json.dumps(State.reply, allow_nan=True)
+        return SimpleNamespace(stdout='{"type":"system","subtype":"init"}\n' + out + '\n', returncode=0)
 
     def refuse(*_, **__):
-        raise AssertionError('the usage hook must never refresh, write or resolve a login')
+        raise AssertionError('the usage hook must never read, refresh or send the Claude Code login')
 
-    monkeypatch.setattr(httpx, 'Client', Client)
-    monkeypatch.setattr(credentials, 'read_claude_code_credentials', lambda: State.creds)
-    for name in ('resolve_anthropic_token', '_refresh_oauth_token', '_write_claude_code_credentials'):
+    monkeypatch.setattr(subprocess, 'run', run)
+    for name in ('read_claude_code_credentials', 'resolve_anthropic_token', '_refresh_oauth_token',
+                 '_write_claude_code_credentials', '_read_claude_code_credentials_from_keychain'):
         monkeypatch.setattr(credentials, name, refuse, raising=False)
-    monkeypatch.delenv('CLAUDE_CODE_OAUTH_TOKEN', raising=False)
+    monkeypatch.setenv('CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND', sys.executable)
     return State
 
 
@@ -74,7 +59,7 @@ def _usage():
     return snapshot, render_account_usage_lines(snapshot)
 
 
-def test_limits_render_one_line_each_in_api_order(api):
+def test_limits_come_from_claude_code_get_usage(cli):
     snapshot, lines = _usage()
     assert [(w.label, w.used_percent) for w in snapshot.windows] == [
         ('Current session', 45.0), ('Current week', 23.0), ('Fable week', 17.0), ('something_new', None), ("['odd']", None)]
@@ -82,51 +67,52 @@ def test_limits_render_one_line_each_in_api_order(api):
     assert lines[0] == '\U0001F4C8 Claude plan limits' and lines[1] == f'Provider: {PROVIDER}'
     assert lines[2].startswith('Current session: 55% remaining (45% used)')
     assert snapshot.details == () and snapshot.unavailable_reason is None
-    (url, headers), = api.requests
-    assert url == 'https://api.anthropic.com/api/oauth/usage' and headers['Authorization'] == 'Bearer login-token'
+    call, = cli.calls
+    assert json.loads(call.input)['request'] == {'subtype': 'get_usage', 'skip_behaviors': True}
+    # Behind the unused admission gate (no inference can leave), and under core's 10 s hook deadline.
+    assert call.env['ANTHROPIC_BASE_URL'].startswith('http://127.0.0.1:') and call.timeout < 10
 
 
-def test_a_body_without_limits_reads_the_legacy_windows(api):
-    api.reply = Response(200, LEGACY)
+def test_a_body_without_limits_reads_the_legacy_windows(cli):
+    cli.reply = _answer(LEGACY)
     snapshot, _ = _usage()
     assert [(w.label, w.used_percent) for w in snapshot.windows] == [('Current session', 40.0), ('Current week', 12.0)]
     assert snapshot.details == ('Extra usage: 1.50 / 10.00 EUR',)
-    assert len(api.requests) == 1
 
 
-def test_setup_token_wins_over_the_stored_login(api, monkeypatch):
-    # Native runs on CLAUDE_CODE_OAUTH_TOKEN when it is set (the headless `claude setup-token` login).
-    monkeypatch.setenv('CLAUDE_CODE_OAUTH_TOKEN', 'setup-token')
-    api.creds = None
-    _usage()
-    assert api.requests[0][1]['Authorization'] == 'Bearer setup-token'
-
-
-@pytest.mark.parametrize('creds, reason', [
-    (None, 'no Claude Code login found (run `claude` and log in)'),
-    (_creds(-timedelta(minutes=5)), 'token expired (run `claude` once to refresh)'),
-    ({'accessToken': 't', 'expiresAt': 'soon'}, 'token expired (run `claude` once to refresh)'),
-])
-def test_no_usable_login_makes_no_request(api, creds, reason):
-    api.creds = creds
-    snapshot, lines = _usage()
-    assert api.requests == [] and lines[-1] == f'Unavailable: {reason}'
+def test_works_with_adopt_external_logins_off_and_follows_the_profile_login(cli, monkeypatch):
+    # #82: with auth.adopt_external_logins false core will not read the CLI login; the CLI itself still can.
+    import directsdk_setup
+    monkeypatch.setattr(directsdk_setup, '_setting', lambda key, default=None: '/logins/work' if key == 'claude_config_dir' else default)
+    cli.reply = _answer(LEGACY)
+    limits, reason = directsdk_setup.fetch_usage()
+    assert reason is None and limits == LEGACY
+    assert cli.calls[-1].env['CLAUDE_CONFIG_DIR'] == '/logins/work'
 
 
 @pytest.mark.parametrize('reply, reason', [
-    (Response(401, {}), 'token rejected (run `claude` once to refresh)'),
-    (Response(403, {}), 'token rejected (run `claude` once to refresh)'),
-    (Response(529, {}), 'usage API returned HTTP 529'),
-    (Response(200, ValueError('not json')), 'usage API returned an unreadable response'),
+    (_answer(None, available=False), 'no Claude subscription login found (run `claude` and log in)'),
+    (_answer(None), 'Claude Code returned no plan limits'),
+    (_answer(None, subtype='error'), 'Claude Code refused the usage request (needs a version with get_usage)'),
+    ('not json', 'Claude Code gave no usage answer (needs a version with get_usage)'),
+    (subprocess.TimeoutExpired('claude', 8), 'Claude Code did not answer in time'),
+    (OSError('gone'), 'Claude Code gave no usage answer (needs a version with get_usage)'),
 ])
-def test_api_failures_name_the_reason(api, reply, reason):
-    api.reply = reply
+def test_failures_name_the_reason(cli, reply, reason):
+    cli.reply = reply
     snapshot, lines = _usage()
     assert snapshot.windows == () and lines[-1] == f'Unavailable: {reason}'
 
 
-def test_network_failure_names_the_reason(api):
-    import httpx
-    api.reply = httpx.ConnectTimeout('slow')
-    _, lines = _usage()
-    assert lines[-1] == 'Unavailable: could not reach the usage API'
+def test_quiet_mode_says_why_limits_are_missing(cli, monkeypatch):
+    import directsdk_setup
+    monkeypatch.setattr(directsdk_setup, 'telemetry_enabled', lambda: False)
+    cli.reply = _answer(None)
+    limits, reason = directsdk_setup.fetch_usage()
+    assert limits is None and 'nonessential traffic off' in reason
+
+
+def test_missing_claude_code_makes_no_call(cli, monkeypatch, tmp_path):
+    monkeypatch.setenv('CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND', str(tmp_path / 'no-such-claude'))
+    snapshot, lines = _usage()
+    assert cli.calls == [] and lines[-1].startswith('Unavailable: Claude Code is not installed')

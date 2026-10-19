@@ -25,7 +25,7 @@ class RequestHeaders(unittest.TestCase):
         encoded, manifest, names = directsdk.request_body(request)
         self.assertEqual(json.loads(encoded), {'tools': []})
         self.assertEqual(manifest, [])
-        self.assertEqual(names, set())
+        self.assertEqual(names, {})
         self.assertEqual(request['extra_headers'], {'traceparent': trace})
         self.assertNotIn(trace, encoded)
 

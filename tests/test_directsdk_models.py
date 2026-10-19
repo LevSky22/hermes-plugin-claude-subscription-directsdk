@@ -34,9 +34,12 @@ def test_native_argv_enables_only_known_long_context_models(profile, tmp_path):
     capture = tmp_path / 'argv.json'
     native = tmp_path / 'native.py'
     native.write_text(FAKE.replace('rows=[]', "pathlib.Path(os.environ['ARGV_CAPTURE']).write_text(json.dumps(sys.argv))\nrows=[]"))
-    aliases = {'sonnet':'claude-sonnet-5-5[1m]', 'opus':'claude-opus-5-5[1m]',
-               'haiku':'claude-haiku-5-5[1m]', 'claude-haiku-4-5':'claude-haiku-4-5-20251001',
-               'fable':'claude-fable-5-1[1m]',
+    aliases = {'sonnet':'claude-sonnet-5-5[1m]', 'sonnet-5-5':'claude-sonnet-5-5[1m]',
+               'sonnet-5.5':'claude-sonnet-5-5[1m]', 'opus':'claude-opus-5-5[1m]',
+               'opus-5-5':'claude-opus-5-5[1m]', 'haiku':'claude-haiku-5-5[1m]',
+               'haiku-5.5':'claude-haiku-5-5[1m]', 'claude-haiku-4-5':'claude-haiku-4-5-20251001',
+               'haiku-4-5':'claude-haiku-4-5-20251001', 'haiku-4.5':'claude-haiku-4-5-20251001',
+               'opus-4.8':'claude-opus-4-8[1m]', 'fable':'claude-fable-5-1[1m]',
                'unqualified-future-model':'unqualified-future-model'}
     with_client = profile.create_client(command=[sys.executable,str(native)], env={'PATH':os.defpath,'HOME':str(tmp_path),'ARGV_CAPTURE':str(capture)})
     try:
@@ -59,7 +62,7 @@ def test_sonnet_5_5_never_receives_the_thinking_disable():
         return json.loads(directsdk.request_body({
             'model': model, 'messages': [{'role': 'user', 'content': 'go'}],
             'extra_body': {'reasoning': {'enabled': False}}})[0])
-    for route in ('sonnet', 'claude-sonnet-5-5', 'claude-sonnet-5-5[1m]'):
+    for route in ('sonnet', 'sonnet-5-5', 'sonnet-5.5', 'claude-sonnet-5-5', 'claude-sonnet-5-5[1m]'):
         assert 'thinking' not in body(route), route
         assert 'context_management' not in body(route), route
     for route in ('claude-sonnet-5', 'claude-sonnet-5[1m]'):
@@ -75,10 +78,10 @@ def test_haiku_5_5_never_receives_the_thinking_disable():
         return json.loads(directsdk.request_body({
             'model': model, 'messages': [{'role': 'user', 'content': 'go'}],
             'extra_body': {'reasoning': reasoning}})[0])
-    for route in ('haiku', 'claude-haiku-5-5', 'claude-haiku-5-5[1m]'):
+    for route in ('haiku', 'haiku-5-5', 'haiku-5.5', 'claude-haiku-5-5', 'claude-haiku-5-5[1m]'):
         assert 'thinking' not in body(route, {'enabled': False}), route
         assert 'context_management' not in body(route, {'enabled': False}), route
         assert body(route, {'enabled': True, 'effort': 'medium'})['thinking'] == {'type': 'adaptive'}, route
-    for route in ('claude-haiku-4-5', 'claude-haiku-4-5-20251001'):
+    for route in ('claude-haiku-4-5', 'claude-haiku-4-5-20251001', 'haiku-4-5', 'haiku-4.5'):
         assert body(route, {'enabled': False})['thinking'] == {'type': 'disabled'}, route
         assert 'thinking' not in body(route, {'enabled': True, 'effort': 'medium'}), route
