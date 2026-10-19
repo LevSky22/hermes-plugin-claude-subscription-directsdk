@@ -1,8 +1,8 @@
 """Setup-time probes of the user's Claude CLI: login state and its own model picker.
 
-Neither sends a Messages request: ``auth status`` reads the local credential store, and the
-``initialize`` handshake enumerates the picker without one (the admission relay proves it by
-counting upstream calls). With the ``claude_code_telemetry`` setting on (the default) the CLI
+None sends a Messages request: ``-p /usage`` lets a due login refresh land, ``auth status`` reads the
+local credential store, and the ``initialize`` handshake enumerates the picker without one (the
+admission relay proves it by counting upstream calls). With the ``claude_code_telemetry`` setting on (the default) the CLI
 fetches its feature flags for the handshake, which is what makes its picker list every model. Anything unexpected returns ``None``/``False`` so callers
 fall back to the pinned catalog rather than failing setup.
 """
@@ -11,7 +11,9 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Mapping
+from pathlib import Path
 
 try:
     from .admission import Admission
@@ -124,6 +126,59 @@ def _child_env(env):
     return apply_traffic_policy(child)
 
 
+# Claude Code's refresh lock is `stale: 60000, update: 5000`: a live holder bumps its mtime every 5 s.
+_REFRESH_LOCK_STALE_S = 60
+# Nothing of the user's is loaded or left behind: no settings, hooks or MCP servers, no session transcript
+# per `/model` switch. Slash commands stay on (`/usage` is one); the prompt goes first because
+# `--mcp-config` takes several values.
+_SETTLE_ARGS = ["-p", "/usage", "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+                "--no-session-persistence"]
+
+
+def _config_dir(child, windows=os.name == "nt"):
+    """The config dir a child started with ``child`` uses: CLAUDE_CONFIG_DIR, which ``apply_config_dir`` set from the
+    profile's setting or the environment, else ``~/.claude`` with Node's ``os.homedir()`` rules (%USERPROFILE% on
+    Windows even when a Git Bash or MSYS shell sets HOME elsewhere; HOME everywhere else)."""
+    config = child.get("CLAUDE_CONFIG_DIR")
+    if config:
+        return Path(config).expanduser()
+    home = (child.get("USERPROFILE") or child.get("HOME")) if windows else child.get("HOME")
+    return (Path(home) if home else Path.home()) / ".claude"
+
+
+def reap_orphaned_refresh_lock(child):
+    """Remove the empty ``.oauth_refresh.lock`` a Claude Code that exited mid-refresh left in the config dir of a
+    child about to start with ``child`` (its env after ``apply_config_dir``).
+
+    Claude Code never reclaims it (anthropics/claude-code#95236), so every later native request fails with
+    "another Claude Code process is refreshing it or exited mid-refresh". Only a lock older than Claude Code's
+    own stale window goes, and ``rmdir`` refuses a directory with contents. The credential store is not opened."""
+    lock = _config_dir(child) / ".oauth_refresh.lock"
+    try:
+        if lock.is_dir() and time.time() - lock.stat().st_mtime > _REFRESH_LOCK_STALE_S:
+            lock.rmdir()
+    except OSError:
+        pass
+
+
+def settle_login(resolved, child, timeout):
+    """Let a due OAuth refresh land before a short-lived probe runs.
+
+    Every Claude Code command starts the refresh at init, and ``auth status`` exits before it lands
+    (anthropics/claude-code#95822): the lock is left behind and the server may already have rotated the
+    refresh token the CLI never saved, which forces a re-login. ``-p /usage`` is a local command that needs a
+    valid token, so it waits for that refresh to be saved before exiting; it sends no Messages request. The
+    plugin cannot tell whether a refresh is due without opening the credential store, so it always runs it.
+    A failed or hung run is bounded by ``timeout`` and never changes what the probe answers."""
+    reap_orphaned_refresh_lock(child)
+    try:
+        with tempfile.TemporaryDirectory(prefix="claude-directsdk-settle-", ignore_cleanup_errors=True) as cwd:
+            subprocess.run(resolved + _SETTLE_ARGS, env=child, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+
+
 def _plan_label(raw):
     """``"pro"`` (auth status) and ``"Claude Pro"`` (handshake) name the same plan."""
     raw = str(raw or "").strip()
@@ -133,14 +188,17 @@ def _plan_label(raw):
 
 
 def setup_status(command=None, env=None, timeout=20):
-    """``{available, logged_in, plan, detail, login_command}`` from the CLI's own ``auth status``."""
+    """``{available, logged_in, plan, detail, login_command}`` from the CLI's own ``auth status``, after
+    ``settle_login`` (which also reaps an orphaned refresh lock) so the probe never strands a due refresh."""
     env = dict(env if env is not None else os.environ)
     resolved = _resolve(command, env)
     if resolved is None:
         return {"available": False, "logged_in": False, "plan": "", "detail": INSTALL_HINT, "login_command": None}
     login_command = resolved + ["auth", "login"]
+    child = _child_env(env)
+    settle_login(resolved, child, timeout)
     try:
-        run = subprocess.run(resolved + ["auth", "status"], env=_child_env(env), stdin=subprocess.DEVNULL,
+        run = subprocess.run(resolved + ["auth", "status"], env=child, stdin=subprocess.DEVNULL,
                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
         auth = json.loads(run.stdout) if run.stdout.strip().startswith("{") else {}
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -241,6 +299,8 @@ def fetch_usage(command=None, env=None, timeout=8):
     if resolved is None:
         return None, INSTALL_HINT
     child = _child_env(env)
+    # An orphaned refresh lock would fail the CLI's own usage fetch (claude-code#95236).
+    reap_orphaned_refresh_lock(child)
     gate = Admission("https://api.anthropic.com", timeout)
     try:
         child["ANTHROPIC_BASE_URL"] = gate.url
