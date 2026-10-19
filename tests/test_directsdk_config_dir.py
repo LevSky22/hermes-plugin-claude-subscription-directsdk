@@ -145,6 +145,8 @@ def test_setup_probes_pass_the_profile_directory(profile, tmp_path, monkeypatch,
     captured = []
     def run(argv, **kwargs):
         captured.append(kwargs["env"])
+        if argv[1:3] == ["-p", "/usage"]:  # the login settle before auth status
+            return SimpleNamespace(stdout="", returncode=0)
         if argv[1:3] == ["auth", "status"]:
             output = PRO["auth"]
         else:
@@ -155,7 +157,7 @@ def test_setup_probes_pass_the_profile_directory(profile, tmp_path, monkeypatch,
     env = {"PATH": os.defpath, "HOME": str(tmp_path), OVERRIDE: str(tmp_path / "override")}
     result = getattr(directsdk_setup, probe)(command=[sys.executable], env=env)
     assert result["logged_in"] if probe == "setup_status" else result
-    assert len(captured) == (1 if probe == "setup_status" else 2)
+    assert len(captured) == (2 if probe == "setup_status" else 3)
     assert all(child[NATIVE_DIR] == selected and OVERRIDE not in child for child in captured)
     assert NATIVE_DIR not in env and OVERRIDE in env
 
