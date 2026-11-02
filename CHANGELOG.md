@@ -13,6 +13,7 @@
 - A tool-less request no longer starts the inert MCP helper or writes its manifest: titles, summaries and other tool-less calls skip ~0.6 s of Python start plus one server handshake per call (#42).
 
 ### Fixed
+- Eager tool-input streaming is opt-in (`CLAUDE_SUBSCRIPTION_DIRECTSDK_EAGER_INPUT_STREAMING=1`): streamed tool arguments are not validated, and a complete tool call with invalid JSON failed the turn with `error_max_turns` on every retry (upstream #221, fix #256).
 
 - An Anthropic API key in Hermes' environment (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_FOUNDRY_API_KEY`), set for Hermes' own `anthropic` provider, no longer blocks this provider: it is dropped from every Claude Code child instead of failing the turn (an explicit `Client(env=...)` keeps it, like the other inherited-environment guards), so both providers work from the same Hermes and a subscription turn never bills API usage. Setup and model discovery no longer pass it to `claude auth status` either.
 - Preserve the upstream request ID in incomplete-response errors, including an HTTP 200 stream cut short by EOF or a connection reset. Only a bounded, validated ID is added to the error text and metadata, without enabling debug logging or changing retry admission.
