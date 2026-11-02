@@ -7,6 +7,7 @@
 - Per-profile `claude_config_dir` setting selects the Claude login for every native spawn in a multiplexed gateway (#34).
 
 ### Fixed
+- Eager tool-input streaming is opt-in (`CLAUDE_SUBSCRIPTION_DIRECTSDK_EAGER_INPUT_STREAMING=1`): streamed tool arguments are not validated, and a complete tool call with invalid JSON failed the turn with `error_max_turns` on every retry (upstream #221, fix #256).
 
 - Claude Code's own context no longer reaches Claude inside the user's message, where Claude took it for a prompt-injection attempt: native's auto memory (`MEMORY.md`) and CLAUDE.md files are not loaded (`--setting-sources ''` left auto memory and the managed CLAUDE.md on), and the relay drops the context native prepends to the conversation's first user turn (the account-email reminder) instead of moving it behind Hermes' frame, matching how every later request replays that turn (#195, thanks @obahareth).
 - Claude's reasoning reaches Hermes again: adaptive-thinking requests ask for `thinking.display: "summarized"`, as core's Anthropic adapter does. Claude 4.7 and later default the display to omitted, which returned signed but empty thinking blocks and left the reasoning panel blank (#45, thanks @mister-ideas). A turn of thinking alone, with no text and no tool call, still reaches Hermes without reasoning, so Hermes nudges the model on instead of taking the thinking as the final answer and ending the tool loop (thanks @100yenadmin, @shaggy2626).
